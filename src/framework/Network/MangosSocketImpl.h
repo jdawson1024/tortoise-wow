@@ -20,6 +20,7 @@
 #include "Auth/Sha1.h"
 #include "WorldSession.h"
 #include "Log.h"
+#include "WorkMetrics.h"
 #include "DBCStores.h"
 
 
@@ -61,6 +62,8 @@ MangosSocket<SessionType, SocketName, Crypt>::~MangosSocket(void)
 template <typename SessionType, typename SocketName, typename Crypt>
 void MangosSocket<SessionType, SocketName, Crypt>::CloseSocket(void)
 {
+    bool notifyClose = false;
+
     {
         GuardType lock(m_OutBufferLock);
 
@@ -69,6 +72,7 @@ void MangosSocket<SessionType, SocketName, Crypt>::CloseSocket(void)
 
         closing_ = true;
         peer().close_writer();
+        notifyClose = true;
     }
 
     {
@@ -76,11 +80,15 @@ void MangosSocket<SessionType, SocketName, Crypt>::CloseSocket(void)
 
         m_Session = nullptr;
     }
+
+    if (notifyClose)
+        ((SocketName*)this)->OnSocketClose();
 }
 
 template <typename SessionType, typename SocketName, typename Crypt>
 int MangosSocket<SessionType, SocketName, Crypt>::SendPacket(const WorldPacket& pct)
 {
+    WorkMetrics::Probe cost(WorkMetrics::SocketQueue);
     GuardType lock(m_OutBufferLock);
 
     if (closing_)
@@ -284,6 +292,7 @@ int MangosSocket<SessionType, SocketName, Crypt>::handle_close(ACE_HANDLE h, ACE
 template <typename SessionType, typename SocketName, typename Crypt>
 int MangosSocket<SessionType, SocketName, Crypt>::Update(void)
 {
+    WorkMetrics::Flush();
     if (closing_)
         return -1;
 

@@ -20,6 +20,8 @@
  */
 
 #include "Object.h"
+#include "DetailedWorkDiagnostics.h"
+#include <shared_mutex>
 #include "SharedDefines.h"
 #include "WorldPacket.h"
 #include "Opcodes.h"
@@ -51,12 +53,19 @@
 #include "InstanceData.h"
 #include "Chat.h"
 #include "Anticheat.h"
+#include "ScriptObjects.h"
+#include "SpellClassMask.h"
 
 #include "packet_builder.h"
 #include "MovementBroadcaster.h"
 #include "PlayerBroadcaster.h"
 
 #include "Autoscaling/AutoScaler.hpp"
+
+#ifdef ENABLE_ELUNA
+#include "LuaEngine.h"
+#include "ElunaEventMgr.h"
+#endif
 
 ////////////////////////////////////////////////////////////
 // Methods of class MovementInfo
@@ -299,7 +308,10 @@ void Object::BuildCreateUpdateBlockForPlayer(UpdateData *data, Player *target) c
     buf << GetPackGUID();
     buf << uint8(m_objectTypeId);
     
-    BuildMovementUpdate(&buf, updateFlags);
+    // The 1.12.1/5875 client can crash while evaluating an in-flight spline
+    // carried by an object's initial create block (ERROR #132 at 0x00453885).
+    // Let the next normal movement packet establish the spline instead.
+    BuildMovementUpdate(&buf, updateFlags, false);
 
     UpdateMask updateMask;
     updateMask.SetCount(m_valuesCount);
@@ -315,6 +327,10 @@ void Object::SendCreateUpdateToPlayer(Player* player)
     BuildCreateUpdateBlockForPlayer(&upd, player);
     upd.Send(player->GetSession());
 }
+
+// cmangos compat: vendored bot module calls IsFriend/IsEnemy on WorldObject*.
+bool WorldObject::IsFriend(WorldObject const* target) const { return target && IsFriendlyTo(target); }
+bool WorldObject::IsEnemy(WorldObject const* target) const { return target && IsHostileTo(target); }
 
 void WorldObject::DirectSendPublicValueUpdate(uint32 index, uint32 count)
 {
@@ -412,7 +428,7 @@ void Object::DestroyForPlayer(Player *target) const
     target->GetSession()->SendPacket(&data);
 }
 
-void Object::BuildMovementUpdate(ByteBuffer * data, uint8 updateFlags) const
+void Object::BuildMovementUpdate(ByteBuffer * data, uint8 updateFlags, bool includeSpline) const
 {
     *data << uint8(updateFlags);                            // update flags
 
@@ -422,6 +438,9 @@ void Object::BuildMovementUpdate(ByteBuffer * data, uint8 updateFlags) const
         ASSERT(unit);
         WorldObject const* wobject = (WorldObject*)this;
         MovementInfo m = wobject->m_movementInfo;
+        if (!includeSpline)
+            m.moveFlags &= ~MOVEFLAG_SPLINE_ENABLED;
+
         if (!m.ctime)
         {
             m.stime = WorldTimer::getMSTime() + 1000;
@@ -440,7 +459,7 @@ void Object::BuildMovementUpdate(ByteBuffer * data, uint8 updateFlags) const
             *data << float(unit->GetSpeed(MOVE_SWIM_BACK));
             *data << float(unit->GetSpeed(MOVE_TURN_RATE));
             // Send current movement informations
-            if (unit->m_movementInfo.moveFlags & MOVEFLAG_SPLINE_ENABLED)
+            if (includeSpline && (m.moveFlags & MOVEFLAG_SPLINE_ENABLED))
                 Movement::PacketBuilder::WriteCreate(*(unit->movespline), *data);
         }
         else
@@ -1961,6 +1980,21 @@ void WorldObject::SendObjectMessageToSet(WorldPacket *data, bool self, WorldObje
 
 void WorldObject::SendMovementMessageToSet(WorldPacket data, bool self, WorldObject const* except)
 {
+    DetailedWork::Scope deliveryWork(DetailedWork::MovementDelivery, GetGUIDLow());
+    if (IsCreature())
+    {
+        if (!IsInWorld())
+            return;
+        // CMaNGOS sends NPC movement to its existing observers instead of
+        // searching camera cells again for each spline packet. Bot sessions
+        // still receive their normal SendPacket hooks. Transport gameobjects
+        // and the native player broadcaster retain their own delivery paths.
+        for (ObjectGuid guid : m_movementViewers.Snapshot())
+            if (Player* viewer = GetMap()->GetPlayer(guid))
+                if (viewer != except && viewer->IsInWorld() && viewer->IsInVisibleList(this))
+                    viewer->GetSession()->SendPacket(&data);
+        return;
+    }
     if (!IsPlayer() || !sWorld.GetBroadcaster()->IsEnabled())
         SendObjectMessageToSet(&data, true, except);
     else
@@ -2031,11 +2065,16 @@ bool WorldObject::isWithinVisibilityDistanceOf(Unit const* viewer, WorldObject c
 void WorldObject::SetMap(Map * map)
 {
     MANGOS_ASSERT(map);
+    if (m_currMap != map)
+        m_movementViewers.Clear();
     m_currMap = map;
     //lets save current map's Id/instanceId
     m_mapId = map->GetId();
     m_InstanceId = map->GetInstanceId();
 
+#ifdef ENABLE_ELUNA
+    elunaMapEvents.reset();
+#endif
 
     // Order is important, must be done after m_currMap is set
     SetZoneScript();
@@ -2241,6 +2280,12 @@ Creature* WorldObject::SummonCreature(uint32 id, float x, float y, float z, floa
 
     if (GetTypeId() == TYPEID_UNIT && ((Creature*)this)->AI())
         ((Creature*)this)->AI()->JustSummoned(pCreature);
+
+#ifdef ENABLE_ELUNA
+    if (Unit* summoner = ToUnit())
+        if (Eluna* e = GetEluna())
+            e->OnSummoned(pCreature, summoner);
+#endif
 
     // Creature Linking, Initial load is handled like respawn
     if (pCreature->IsLinkingEventTrigger())
@@ -2612,7 +2657,11 @@ struct WorldObjectChangeAccumulator
         // send self fields changes in another way, otherwise
         // with new camera system when player's camera too far from player, camera wouldn't receive packets and changes from player
         if (i_object.isType(TYPEMASK_PLAYER))
-            i_object.BuildUpdateDataForPlayer((Player*)&i_object, i_updateDatas);
+        {
+            Player* player = static_cast<Player*>(&i_object);
+            if (player->GetSession() && player->GetSession()->GetSocket())
+                i_object.BuildUpdateDataForPlayer(player, i_updateDatas);
+        }
     }
 
     void Visit(CameraMapType &m)
@@ -2620,7 +2669,12 @@ struct WorldObjectChangeAccumulator
         for (const auto& iter : m)
         {
             Player* owner = iter.getSource()->GetOwner();
-            if (owner != &i_object && owner->IsInVisibleList_Unsafe(&i_object))
+            // A socketless playerbot consumes game state directly from the
+            // server and has no handler for SMSG_(COMPRESSED_)UPDATE_OBJECT.
+            // Do not spend CPU serialising and compressing client-only field
+            // updates that WorldSession would discard immediately.
+            if (owner != &i_object && owner->GetSession() && owner->GetSession()->GetSocket() &&
+                owner->IsInVisibleList_Unsafe(&i_object))
                 i_object.BuildUpdateDataForPlayer(owner, i_updateDatas);
         }
     }
@@ -2715,14 +2769,24 @@ void WorldObject::DestroyForNearbyPlayers()
         if (plr == this)
             continue;
 
-        if (!plr->IsInVisibleList_Unsafe(this))
+        // The locking form, not _Unsafe: nothing up this call chain holds the
+        // visibility lock (callers are Creature.cpp, felwood, alterac), so the
+        // shared_lock is free to take and the racy read is gone.
+        if (!plr->IsInVisibleList(this))
             continue;
 
         if (isType(TYPEMASK_UNIT) && ((Unit*)this)->GetCharmerGuid() == plr->GetObjectGuid()) // TODO: this is for puppet
             continue;
 
         DestroyForPlayer(plr);
-        plr->m_visibleGUIDs.erase(GetGUID());
+        // The unguarded writer that corrupted the buckets. DestroyForPlayer
+        // does network work, so it stays OUTSIDE the lock - only the erase
+        // needs it.
+        {
+            std::unique_lock<std::shared_mutex> lock(plr->m_visibleGUIDs_lock);
+            plr->m_visibleGUIDs.erase(GetGUID());
+            RemoveMovementViewer(plr->GetObjectGuid());
+        }
 
         if (ToPlayer() && ToPlayer()->m_broadcaster)
             ToPlayer()->m_broadcaster->RemoveListener(plr);
@@ -3656,7 +3720,19 @@ uint32 WorldObject::GetWeaponSkillValue(WeaponAttackType attType, WorldObject co
         return pPlayer->GetSkillValue(skill);
     }
 
-    return GetUnitMeleeSkill(target);
+    uint32 skill = GetUnitMeleeSkill(target);
+    if (Pet const* pet = ToPet())
+    {
+        if (Unit const* owner = pet->GetOwner())
+        {
+            if (owner->HasAura(51555))      // Bestial Precision Rank 2
+                skill += 10;
+            else if (owner->HasAura(51554)) // Bestial Precision Rank 1
+                skill += 5;
+        }
+    }
+
+    return skill;
 }
 
 uint32 WorldObject::GetDefenseSkillValue(WorldObject const* target) const
@@ -3814,7 +3890,7 @@ float WorldObject::MeleeSpellMissChance(Unit* pVictim, WeaponAttackType attType,
                     hitChance += owner->m_modSpellHitChance * aura->GetModifier()->m_amount / 100.0f;
             }
         }
-    } 
+    }
 
     // There is some code in 1.12 that explicitly adds a modifier that causes the first 1% of +hit gained from
     // talents or gear to be ignored against monsters with more than 10 Defense Skill above the attacking players Weapon Skill.
@@ -4250,6 +4326,14 @@ int32 WorldObject::DealHeal(Unit *pVictim, uint32 addhealth, SpellEntry const *s
     if (pVictim->AI() && pUnit)
         pVictim->AI()->HealedBy(pUnit, addhealth);
 
+    if (pUnit)
+    {
+        ScriptRegistry<UnitScript>::ForEachEnabledHook(UNITHOOK_ON_HEAL, [&](UnitScript* script)
+        {
+            script->OnHeal(pUnit, pVictim, addhealth);
+        });
+    }
+
     int32 gain = pVictim->ModifyHealth(int32(addhealth));
 
     WorldObject* pHealer = this;
@@ -4278,7 +4362,18 @@ void WorldObject::SendHealSpellLog(Unit const* pVictim, uint32 SpellID, uint32 D
 
 void WorldObject::EnergizeBySpell(Unit* pVictim, uint32 spellId, uint32 amount, Powers powerType)
 {
-    SendEnergizeSpellLog(pVictim, spellId, amount, powerType);
+    uint32 logAmount = amount;
+    if (powerType == POWER_MANA && logAmount)
+    {
+        int32 const manaGainMod = pVictim->GetTotalAuraModifier(SPELL_AURA_MOD_MANA_GAIN_PERCENT);
+        if (manaGainMod)
+        {
+            float const multiplier = std::max(0.0f, (100.0f + manaGainMod) / 100.0f);
+            logAmount = uint32(float(logAmount) * multiplier);
+        }
+    }
+
+    SendEnergizeSpellLog(pVictim, spellId, logAmount, powerType);
 
     // Turtle: threat from power gains as per RMJ's explanations
     if (Unit* pUnit = ToUnit())
@@ -4293,7 +4388,7 @@ void WorldObject::EnergizeBySpell(Unit* pVictim, uint32 spellId, uint32 amount, 
                 multiplier = 0.5f;
                 break;
         }
-        pVictim->GetHostileRefManager().threatAssist(pUnit, amount * multiplier, sSpellMgr.GetSpellEntry(spellId));
+        pVictim->GetHostileRefManager().threatAssist(pUnit, logAmount * multiplier, sSpellMgr.GetSpellEntry(spellId));
     }
 
     // needs to be called after sending spell log
@@ -4751,6 +4846,25 @@ uint32 WorldObject::SpellHealingBonusDone(Unit* pVictim, SpellEntry const* spell
                 case 3736: // Hateful Totem of the Third Wind / Increased Lesser Healing Wave / Savage Totem of the Third Wind
                     DoneTotal += i->GetModifier()->m_amount;
                     break;
+                case 5069: // Spiritual Healing
+                    DoneTotalMod *= (100.0f + i->GetModifier()->m_amount) / 100.0f;
+                    break;
+                case 5065: // Empowered Recovery
+                {
+                    if (!pVictim)
+                        break;
+
+                    Unit::AuraList const& periodicHeals = pVictim->GetAurasByType(SPELL_AURA_PERIODIC_HEAL);
+                    for (Aura const* aura : periodicHeals)
+                    {
+                        if (aura->GetSpellProto()->IsFitToFamily<SPELLFAMILY_PRIEST, CF_PRIEST_RENEW>())
+                        {
+                            DoneTotalMod *= (100.0f + i->GetModifier()->m_amount) / 100.0f;
+                            break;
+                        }
+                    }
+                    break;
+                }
                 default:
                     break;
             }
@@ -4855,6 +4969,7 @@ uint32 WorldObject::SpellDamageBonusDone(Unit* pVictim, SpellEntry const* spellP
 
     float DoneTotalMod = 1.0f;
     int32 DoneTotal = 0;
+    int32 DoneTotalNoCoeff = 0;
     Item*  pWeapon = GetTypeId() == TYPEID_PLAYER ? ((Player*)this)->GetWeaponForAttack(BASE_ATTACK, true, false) : nullptr;
 
     // Creature damage
@@ -4886,6 +5001,10 @@ uint32 WorldObject::SpellDamageBonusDone(Unit* pVictim, SpellEntry const* spellP
     }
 
     uint32 creatureTypeMask = pVictim->GetCreatureTypeMask();
+
+    // Native periodic-damage bonus: school mask from the aura, DOT only.
+    if (pUnit && damagetype == DOT)
+        DoneTotalMod *= pUnit->GetTotalAuraMultiplierByMiscMask(SPELL_AURA_MOD_PERIODIC_DAMAGE_PERCENT_DONE, spellProto->GetSpellSchoolMask());
 
     // Add pct bonus from spell damage versus
     if (pUnit)
@@ -4920,6 +5039,41 @@ uint32 WorldObject::SpellDamageBonusDone(Unit* pVictim, SpellEntry const* spellP
                 continue;
             switch (i->GetModifier()->m_miscvalue)
             {
+                case 5066:
+                {
+                    if (!owner->HasAura(51578))
+                        DoneTotalMod += i->GetModifier()->m_amount / 100.0f;
+                    break;
+                }
+                case 5067: // Trap Mastery
+                {
+                    DoneTotalMod += i->GetModifier()->m_amount / 100.0f;
+                    break;
+                }
+                case 5068: // Untamed Trapper
+                {
+                    float const attackPower = owner->GetTotalAttackPowerValue(BASE_ATTACK);
+                    switch (spellProto->Id)
+                    {
+                        case 13797:
+                        case 14298:
+                        case 14299:
+                        case 14300:
+                        case 14301:
+                            if (effectIndex == EFFECT_INDEX_0)
+                                DoneTotalNoCoeff += int32(attackPower / 10.0f);
+                            break;
+                        case 13812:
+                        case 14314:
+                        case 14315:
+                            if (effectIndex == EFFECT_INDEX_0)
+                                DoneTotalNoCoeff += int32(attackPower / 6.5f);
+                            else if (effectIndex == EFFECT_INDEX_1)
+                                DoneTotalNoCoeff += int32(attackPower / 30.0f);
+                            break;
+                    }
+                    break;
+                }
                 case 4418: // Increased Shock Damage
                 case 4554: // Increased Lightning Damage
                 {
@@ -4964,7 +5118,7 @@ uint32 WorldObject::SpellDamageBonusDone(Unit* pVictim, SpellEntry const* spellP
     // apply ap bonus and benefit affected by spell power implicit coeffs and spell level penalties
     DoneTotal = SpellBonusWithCoeffs(spellProto, effectIndex, DoneTotal, DoneAdvertisedBenefit, 0, damagetype, true, this, spell);
 
-    float tmpDamage = (int32(pdamage) + DoneTotal * int32(stack)) * DoneTotalMod;
+    float tmpDamage = (int32(pdamage) + (DoneTotal + DoneTotalNoCoeff) * int32(stack)) * DoneTotalMod;
     // apply spellmod to Done damage (flat and pct)
     if (pUnit)
     {
@@ -5203,6 +5357,30 @@ bool WorldObject::CheckAndIncreaseCastCounter()
     ++m_castCounter;
     return true;
 }
+
+#ifdef ENABLE_ELUNA
+Eluna* WorldObject::GetEluna() const
+{
+    return IsInWorld() ? GetMap()->GetEluna() : nullptr;
+}
+
+ElunaEventProcessor* WorldObject::GetElunaEvents(int32 mapId)
+{
+    Eluna* eluna = mapId == -1 ? sWorld.GetEluna() : GetEluna();
+    if (!eluna || !eluna->eventMgr)
+        return nullptr;
+
+    EventMgr* eventMgr = eluna->eventMgr.get();
+    std::unique_ptr<ElunaProcessorInfo>& info = mapId == -1 ? elunaWorldEvents : elunaMapEvents;
+    if (!info)
+    {
+        uint64 id = eventMgr->CreateObjectProcessor(this);
+        info = std::make_unique<ElunaProcessorInfo>(eventMgr, id);
+    }
+
+    return eventMgr->GetObjectProcessor(info->GetProcessorId());
+}
+#endif
 
 void WorldObject::MoveChannelledSpellWithCastTime(Spell* pSpell)
 {

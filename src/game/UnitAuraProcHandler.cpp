@@ -34,6 +34,9 @@
 #include "ScriptMgr.h"
 #include "Util.h"
 
+#include <mutex>
+#include <unordered_set>
+
 pAuraProcHandler AuraProcHandler[TOTAL_AURAS] =
 {
     &Unit::HandleNULLProc,                                  //  0 SPELL_AURA_NONE
@@ -263,6 +266,10 @@ pAuraProcHandler AuraProcHandler[TOTAL_AURAS] =
     &Unit::HandleModBlockDamagePercentAuraProc,             //224 SPELL_AURA_MOD_BLOCK_DAMAGE_PERCENT
     &Unit::HandleNULLProc,                                  //225 SPELL_AURA_MOD_GATHERING_ITEM_CHANCE
     &Unit::HandleModRageFromDamageDealtAuraProc,            //226 SPELL_AURA_MOD_RAGE_FROM_DAMAGE_DEALT
+    &Unit::HandleNULLProc,                                  //227 SPELL_AURA_MOD_ATTACKING_RAGE_PERCENT
+    &Unit::HandleNULLProc,                                  //228 SPELL_AURA_MOD_SKILL_CAST_TIME
+    &Unit::HandleNULLProc,                                  //229 SPELL_AURA_MOD_PERIODIC_DAMAGE_PERCENT_DONE
+    &Unit::HandleNULLProc,                                  //230 SPELL_AURA_MOD_CHAIN_DAMAGE_PERCENT_TAKEN
 };
 
 // Fonctions Nostalrius
@@ -353,8 +360,11 @@ SpellProcEventTriggerCheck Unit::IsTriggeredAtSpellProcEvent(Unit *pVictim, Spel
         return SPELL_PROC_TRIGGER_FAILED;
 
     // In most cases req get honor or XP from kill
-    if ((EventProcFlag & PROC_FLAG_KILL) && IsPlayer())
+    if ((EventProcFlag & procFlag & PROC_FLAG_KILL) && IsPlayer())
     {
+        if (!pVictim)
+            return SPELL_PROC_TRIGGER_FAILED;
+
         bool allow = ((Player*)this)->IsHonorOrXPTarget(pVictim);
         if (!allow)
             return SPELL_PROC_TRIGGER_FAILED;
@@ -509,68 +519,6 @@ SpellAuraProcResult Unit::HandleDummyAuraProc(Unit *pVictim, uint32 damage, int3
                         basepoints[0] = (int32)GetMaxHealth() / 2;
 
                     triggered_spell_id = 25997;
-                    break;
-                }
-                // Sweeping Strikes
-                case 12292:
-                case 18765:
-                {
-                    if (!pVictim || !pVictim->IsAlive())
-                        return SPELL_AURA_PROC_FAILED;
-
-                    // Prevent chain of triggered spell from same triggered spell
-                    if (procSpell && (procSpell->Id == 26654 || procSpell->Id == 12723))
-                        return SPELL_AURA_PROC_FAILED;
-
-                    // Don't proc on rend
-                    if (procSpell && !procSpell->IsDirectDamageSpell())
-                        return SPELL_AURA_PROC_FAILED;
-
-                    // Don't proc on absorb
-                    if (!damage)
-                        return SPELL_AURA_PROC_FAILED;
-
-                    // Fix range for target selection when proccing SS with whirlwind. Whirlwind doesn't
-                    // have a radius set on its prototype, but it is 8 yards.
-                    float radius = ATTACK_DISTANCE;
-                    if (procSpell && procSpell->Id == 1680)
-                        radius = 8.0f;
-
-                    // World of Warcraft Client Patch 1.7.0 (2005-09-13)
-                    // - Sweeping Strikes will now ignore dead targets, and will ignore PvP
-                    //   enabled targets if you are not PvP enabled.
-                    target = SelectRandomUnfriendlyTarget(pVictim, radius, false, true, true);
-                    if (!target)
-                        return SPELL_AURA_PROC_OK; // eat charge even if no target
-
-                    // Case for Execute. This will only run when procced by Execute
-                    if (procSpell && procSpell->Id == 20647)
-                    {
-                        if (pVictim->GetHealthPercent() <= 20.0f && target->GetHealthPercent() <= 20.0f)  // If Both Target A and target B is less or equal than 20% do full damage
-                        {
-						    int32 initialDamage = damage * 100 / CalcArmorReducedDamage(pVictim, 100);
-						    basepoints[0] = initialDamage * CalcArmorReducedDamage(target, 100) / 100;
-
-                            triggered_spell_id = 12723; //Note this SS id deals 1 damage by itself (Cannot crit)
-                        }
-                        else if (pVictim->GetHealthPercent() <= 20.0f)    // If only Target A is less or equal than 20% and target B is over 20% do Basic attack damage
-                        {
-                            triggered_spell_id = 26654;    // This SS deals damage equal to AA also this spell ID can crit ?? Maybe this explains the rumor of SS criting since it only scales with spell crit ? = 5% crit.
-                        }
-                        else // Full damage on anything else (Shouldn't really ever be used) since execute can only be used less or equal than 20% anyway.
-                        {
-							int32 initialDamage = damage * 100 / CalcArmorReducedDamage(pVictim, 100);
-							basepoints[0] = initialDamage * CalcArmorReducedDamage(target, 100) / 100;
-
-                            triggered_spell_id = 12723;    //Note this SS id deals 1 damage by itself (Cannot crit)
-                        }
-                    }
-                    else // Full damage on anything else
-                    {
-						int32 initialDamage = damage * 100 / CalcArmorReducedDamage(pVictim, 100);
-						basepoints[0] = initialDamage * CalcArmorReducedDamage(target, 100) / 100;
-                        triggered_spell_id = 12723;    //Note this SS id deals 1 damage by itself (Cannot crit)
-                    }
                     break;
                 }
                 // Twisted Reflection (boss spell)
@@ -881,8 +829,20 @@ SpellAuraProcResult Unit::HandleProcTriggerSpellAuraProc(Unit* pVictim, uint32 d
     SpellEntry const* triggerEntry = sSpellMgr.GetSpellEntry(trigger_spell_id);
     if (!triggerEntry)
     {
-        // Not cast unknown spell
-        sLog.outError("Unit::HandleProcTriggerSpell: Spell %u have %u in EffectTriggered[%d], not handled custom case?", auraSpellInfo->Id, trigger_spell_id, triggeredByAura->GetEffIndex());
+        // A malformed spell row may be evaluated every combat tick. Keep the
+        // diagnostic actionable without producing hundreds of identical log
+        // lines and making an already slow map update even more expensive.
+        static std::mutex reportedProcMutex;
+        static std::unordered_set<uint64> reportedProcPairs;
+        uint64 const pairKey = (uint64(auraSpellInfo->Id) << 32) | trigger_spell_id;
+        bool firstReport = false;
+        {
+            std::lock_guard<std::mutex> lock(reportedProcMutex);
+            firstReport = reportedProcPairs.insert(pairKey).second;
+        }
+        if (firstReport)
+            sLog.outError("Unit::HandleProcTriggerSpell: aura spell %u references missing trigger spell %u (effect %u); suppressing duplicate reports",
+                          auraSpellInfo->Id, trigger_spell_id, uint32(triggeredByAura->GetEffIndex()));
         return SPELL_AURA_PROC_FAILED;
     }
 
@@ -896,13 +856,6 @@ SpellAuraProcResult Unit::HandleProcTriggerSpellAuraProc(Unit* pVictim, uint32 d
         {
             target = pVictim;
             break;
-        }
-        // Combo points add triggers (need add combopoint only for main target, and after possible combopoints reset)
-        case 15250: // Rogue Setup
-        {
-            if (!pVictim || pVictim != GetVictim())  // applied only for main target
-                return SPELL_AURA_PROC_FAILED;
-            break;                                   // continue normal case
         }
         // Finishing moves that add combo points
         case 14189: // Seal Fate (Netherblade set)

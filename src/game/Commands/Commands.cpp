@@ -29,6 +29,7 @@
 #include "GuildMgr.h"
 #include "GuidObjectScaling.h"
 #include "HardcodedEvents.h"
+#include "HonorMgr.h"
 #include "InstanceData.h"
 #include "Item.h"
 #include "ItemEnchantmentMgr.h"
@@ -239,6 +240,13 @@ bool ChatHandler::HandleReloadMangosStringCommand(char* /*args*/)
     return true;
 }
 
+bool ChatHandler::HandleReloadModuleStringCommand(char* /*args*/)
+{
+    sObjectMgr.LoadModuleStrings();
+    SendSysMessage("DB tables `module_string` and `module_string_locale` reloaded.");
+    return true;
+}
+
 bool ChatHandler::HandleReloadHousingCommand(char* /*args*/)
 {
     sObjectMgr.LoadGuildHouses();
@@ -282,7 +290,9 @@ bool ChatHandler::HandleAccountSetGmLevelCommand(char* args)
     if (!ExtractInt32(&args, gm))
         return false;
 
-    if (gm < SEC_PLAYER || gm > SEC_ADMINISTRATOR)
+    // SEC_CONSOLE is reserved for the command-line console, but SEC_SIGMACHAD
+    // is a valid playable account rank and must be assignable here.
+    if (gm < SEC_PLAYER || gm > SEC_SIGMACHAD)
     {
         SendSysMessage(LANG_BAD_VALUE);
         SetSentErrorMessage(true);
@@ -5341,7 +5351,7 @@ bool ChatHandler::HandleInstanceStatsCommand(char* /*args*/)
 bool ChatHandler::HandleGMListFullCommand(char* /*args*/)
 {
     ///- Get the accounts with GM Level >0
-    QueryResult *result = LoginDatabase.Query("SELECT username, rank FROM account"
+    QueryResult *result = LoginDatabase.Query("SELECT username, `rank` FROM account"
                           " WHERE rank > 0");
     if (result)
     {
@@ -6332,7 +6342,7 @@ bool ChatHandler::HandleUnstuckCommand(char* /*args*/)
         WorldSafeLocsEntry const* ClosestGrave = sObjectMgr.GetClosestGraveYard(pPlayer->GetPositionX(), pPlayer->GetPositionY(), pPlayer->GetPositionZ(), pPlayer->GetMapId(), pPlayer->GetTeam());
 
         if (!ClosestGrave) //No nearby graveyards (stuck in void?). Send ally to Westfall, Horde to Barrens.
-            ClosestGrave = pPlayer->GetTeamId() ? sWorldSafeLocsStore.LookupEntry(10) : sWorldSafeLocsStore.LookupEntry(4);
+            ClosestGrave = pPlayer->GetTeamId() ? sWorldSafeLocsStore.LookupEntry(9) : sWorldSafeLocsStore.LookupEntry(4);
 
         if (ClosestGrave)
             pPlayer->TeleportTo(ClosestGrave->map_id, ClosestGrave->x, ClosestGrave->y, ClosestGrave->z, sObjectMgr.GetWorldSafeLocFacing(ClosestGrave->ID), 0);
@@ -6697,6 +6707,28 @@ bool ChatHandler::HandleGMCommand(char* args)
         m_session->SendNotification(LANG_GM_OFF);
     }
 
+    return true;
+}
+
+// Enable/disable free flight for the selected player, or the issuing player
+// when no player target is selected. The Turtle player implementation already
+// owns the movement flags and heartbeat update; the command was simply absent.
+bool ChatHandler::HandleGMFlyCommand(char* args)
+{
+    bool value;
+    if (!ExtractOnOff(&args, value))
+    {
+        SendSysMessage(LANG_USE_BOL);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    Player* target = GetSelectedPlayer();
+    if (!target)
+        target = m_session->GetPlayer();
+
+    target->SetFly(value);
+    PSendSysMessage(LANG_COMMAND_FLYMODE_STATUS, GetNameLink(target).c_str(), value ? "on" : "off");
     return true;
 }
 
@@ -11566,7 +11598,13 @@ bool ChatHandler::HandleModifyHonorCommand(char* args)
         return false;
 
     // hack code
-    if (hasStringAbbr(field, "points"))
+    if (hasStringAbbr(field, "currency"))
+    {
+        target->GetHonorMgr().ModifySpendableHonor(amount);
+        PSendSysMessage("Honor currency of %s is now %u.", target->GetName(), target->GetHonorMgr().GetSpendableHonor());
+        return true;
+    }
+    else if (hasStringAbbr(field, "points"))
     {
         if (amount < 0 || amount > 255)
             return false;
@@ -16247,7 +16285,18 @@ bool ChatHandler::HandleCartographerCommand(char* args)
     {
         PSendSysMessage("You have %u areas left to explore.", count);
         if (AreaEntry const* pAreaEntry = sObjectMgr.GetAreaEntryByExploreFlag(lastUnexploredFlag))
+        {
+            if (pAreaEntry->ZoneId)
+            {
+                if (AreaEntry const* pZoneEntry = AreaEntry::GetById(pAreaEntry->ZoneId))
+                {
+                    PSendSysMessage("Next: %s (%s)", pAreaEntry->Name, pZoneEntry->Name);
+                    return true;
+                }
+            }
+
             PSendSysMessage("Next: %s", pAreaEntry->Name);
+        }
     }
     else
         SendSysMessage("You have explored all areas.");

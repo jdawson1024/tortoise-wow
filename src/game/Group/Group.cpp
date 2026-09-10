@@ -39,6 +39,7 @@
 #include "LFGHandler.h"
 #include "Chat.h"
 #include "Logging/DatabaseLogger.hpp"
+#include "ScriptObjects.h"
 
 #include <array>
 
@@ -146,7 +147,7 @@ bool Group::Create(ObjectGuid guid, const char * name)
         CharacterDatabase.PExecute("DELETE FROM `groups` WHERE groupId ='%u'", m_Id);
         CharacterDatabase.PExecute("DELETE FROM group_member WHERE groupId ='%u'", m_Id);
 
-        CharacterDatabase.PExecute("INSERT INTO groups(groupId,leaderGuid,mainTank,mainAssistant,lootMethod,looterGuid,lootThreshold,icon1,icon2,icon3,icon4,icon5,icon6,icon7,icon8,isRaid) "
+        CharacterDatabase.PExecute("INSERT INTO `groups`(groupId,leaderGuid,mainTank,mainAssistant,lootMethod,looterGuid,lootThreshold,icon1,icon2,icon3,icon4,icon5,icon6,icon7,icon8,isRaid) "
                                    "VALUES('%u','%u','%u','%u','%u','%u','%u','" UI64FMTD "','" UI64FMTD "','" UI64FMTD "','" UI64FMTD "','" UI64FMTD "','" UI64FMTD "','" UI64FMTD "','" UI64FMTD "','%u')",
                                    m_Id, m_leaderGuid.GetCounter(), m_mainTankGuid.GetCounter(), m_mainAssistantGuid.GetCounter(), uint32(m_lootMethod),
                                    m_looterGuid.GetCounter(), uint32(m_lootThreshold),
@@ -164,6 +165,11 @@ bool Group::Create(ObjectGuid guid, const char * name)
         CharacterDatabase.CommitTransaction();
 
     _updateLeaderFlag();
+
+    ScriptRegistry<GroupScript>::ForEach([&](GroupScript* script)
+    {
+        script->OnCreate(this, m_leaderGuid, static_cast<uint8>(m_groupType));
+    });
 
     return true;
 }
@@ -232,7 +238,7 @@ void Group::ConvertToRaid()
     _initRaidSubGroupsCounter();
 
     if (!isBGGroup())
-        CharacterDatabase.PExecute("UPDATE groups SET isRaid = 1 WHERE groupId='%u'", m_Id);
+        CharacterDatabase.PExecute("UPDATE `groups` SET isRaid = 1 WHERE groupId='%u'", m_Id);
     SendUpdate();
 
     // update quest related GO states (quest activity dependent from raid membership)
@@ -256,6 +262,11 @@ bool Group::AddInvite(Player *player)
     m_invitees.insert(player);
 
     player->SetGroupInvite(this);
+
+    ScriptRegistry<GroupScript>::ForEach([&](GroupScript* script)
+    {
+        script->OnInviteMember(this, player->GetObjectGuid());
+    });
 
     return true;
 }
@@ -432,6 +443,11 @@ bool Group::AddMember(ObjectGuid guid, const char* name, uint8 joinMethod)
         }
     }
 
+    ScriptRegistry<GroupScript>::ForEach([&](GroupScript* script)
+    {
+        script->OnAddMember(this, guid);
+    });
+
     return true;
 }
 
@@ -505,6 +521,11 @@ uint32 Group::RemoveMember(ObjectGuid guid, uint8 removeMethod)
             sLFGMgr.UpdateGroup(m_Id);
 
         SendUpdate();
+
+        ScriptRegistry<GroupScript>::ForEach([&](GroupScript* script)
+        {
+            script->OnRemoveMember(this, guid, removeMethod);
+        });
     }
     // if group before remove <= 2 disband it
     else
@@ -519,16 +540,27 @@ void Group::ChangeLeader(ObjectGuid guid)
     if (slot == m_memberSlots.end())
         return;
 
+    ObjectGuid oldLeaderGuid = m_leaderGuid;
     _setLeader(guid);
 
     WorldPacket data(SMSG_GROUP_SET_LEADER, slot->name.size() + 1);
     data << slot->name;
     BroadcastPacket(&data, true);
     SendUpdate();
+
+    ScriptRegistry<GroupScript>::ForEach([&](GroupScript* script)
+    {
+        script->OnChangeLeader(this, guid, oldLeaderGuid);
+    });
 }
 
 void Group::Disband(bool hideDestroy, ObjectGuid initiator)
 {
+    ScriptRegistry<GroupScript>::ForEach([&](GroupScript* script)
+    {
+        script->OnDisband(this);
+    });
+
     Player* player;
     Player* remainingPlayer = nullptr;
 
@@ -964,6 +996,15 @@ bool Group::CountRollVote(ObjectGuid const& playerGUID, Rolls::iterator& rollI, 
     return false;
 }
 
+Roll const* Group::GetActiveRoll(ObjectGuid const& lootedTarget, uint32 itemSlot) const
+{
+    for (Roll const* roll : RollId)
+        if (roll && roll->lootedTargetGUID == lootedTarget && roll->itemSlot == itemSlot)
+            return roll;
+
+    return nullptr;
+}
+
 void Group::StartLootRoll(Creature* lootTarget, LootMethod method, Loot* loot, uint8 itemSlot)
 {
     if (itemSlot >= loot->items.size())
@@ -1080,20 +1121,30 @@ void Group::CountTheRoll(Rolls::iterator& rollI)
     }
 
     // Turtle:: Make raid looted items not appear soul bound.
-    const auto CheckSoulboundException = [this](Player* player, const LootItem& lootItem, Item* newitem, Creature* creature)
+    const auto CheckSoulboundException = [this](Player* player, const LootItem& lootItem, Item* newitem, Creature* creature, bool isGameObjectLoot)
     {
         auto itemProto = newitem->GetProto();
-        if (player->GetMap()->IsRaid() && creature && itemProto && (creature->IsWorldBoss() || itemProto->Quality >= ITEM_QUALITY_RARE))
+        if (player->GetMap()->IsRaid() && itemProto)
         {
-            if (!lootItem.freeforall && itemProto->Stackable <= 1)
+            bool canBeTemporarilyTraded = isGameObjectLoot && itemProto->Quality >= ITEM_QUALITY_RARE;
+            canBeTemporarilyTraded |= creature && (creature->IsWorldBoss() || itemProto->Quality >= ITEM_QUALITY_RARE);
+
+            if (canBeTemporarilyTraded && !lootItem.freeforall && itemProto->Stackable <= 1)
             {
                 newitem->SetCanTradeWithRaidUntil(sWorld.GetGameTime() + 10 * MINUTE, player->GetMapId());
                 for (GroupReference* itr = GetFirstMember(); itr != nullptr; itr = itr->next())
                 {
                     if (Player* pMember = itr->getSource())
                     {
-                        if (pMember->GetMapId() == player->GetMapId() && creature->WasPlayerPresentAtDeath(pMember))
+                        if (creature)
+                        {
+                            if (pMember->GetMapId() == player->GetMapId() && creature->WasPlayerPresentAtDeath(pMember))
+                                newitem->AddPlayerToAllowedTradeList(pMember->GetObjectGuid());
+                        }
+                        else if (pMember->GetMapId() == player->GetMapId() && pMember->GetInstanceId() == player->GetInstanceId())
+                        {
                             newitem->AddPlayerToAllowedTradeList(pMember->GetObjectGuid());
+                        }
                     }
                 }
                 //force refresh of soulbound-ness since we don't hook into CreateItem anymore.
@@ -1158,7 +1209,7 @@ void Group::CountTheRoll(Rolls::iterator& rollI)
 
                     if (Item* newItem = player->StoreNewItem(dest, roll->itemid, true, item->randomPropertyId))
                     {
-                        CheckSoulboundException(player, *item, newItem, roll->lootedTargetGUID.IsCreature() ? player->GetMap()->GetCreature(roll->lootedTargetGUID) : nullptr);
+                        CheckSoulboundException(player, *item, newItem, roll->lootedTargetGUID.IsCreature() ? player->GetMap()->GetCreature(roll->lootedTargetGUID) : nullptr, roll->lootedTargetGUID.IsGameObject());
                         player->OnReceivedItem(newItem);
                     }
                 }
@@ -1228,7 +1279,7 @@ void Group::CountTheRoll(Rolls::iterator& rollI)
 
                     if (Item* newItem = player->StoreNewItem(dest, roll->itemid, true, item->randomPropertyId))
                     {
-                        CheckSoulboundException(player, *item, newItem, roll->lootedTargetGUID.IsCreature() ? player->GetMap()->GetCreature(roll->lootedTargetGUID) : nullptr);
+                        CheckSoulboundException(player, *item, newItem, roll->lootedTargetGUID.IsCreature() ? player->GetMap()->GetCreature(roll->lootedTargetGUID) : nullptr, roll->lootedTargetGUID.IsGameObject());
                         player->OnReceivedItem(newItem);
                     }
                 }
@@ -1417,9 +1468,32 @@ void Group::UpdatePlayerOutOfRange(Player* pPlayer)
     pPlayer->GetSession()->BuildPartyMemberStatsChangedPacket(pPlayer, &data);
 
     for (GroupReference *itr = GetFirstMember(); itr != nullptr; itr = itr->next())
-        if (Player *player = itr->getSource())
-            if (player != pPlayer && !player->IsInVisibleList(pPlayer)) // Possible unsafe call (cross maps groups)
-                player->GetSession()->SendPacket(&data);
+    {
+        Player* player = itr->getSource();
+        if (!player || player == pPlayer)
+            continue;
+
+        // The IsInVisibleList call below reads the OTHER player's client-GUID
+        // set, and that set is rebuilt by the map thread which owns HIM. Doing
+        // it from our thread was flagged here as "possible unsafe call (cross
+        // maps groups)" and it is exactly that: SIGSEGV inside
+        // _Hashtable::find, with ten parallel instance groups whose members
+        // cross map boundaries constantly (crash_2026-08-28_12-42-56).
+        //
+        // Same behaviour, no cross-thread read: a player on a DIFFERENT map
+        // cannot have pPlayer in his visible list at all, so IsInVisibleList
+        // would have answered false and the packet would have gone out anyway.
+        // The call is not replaced, only skipped where its answer is already
+        // known - which is precisely where it was unsafe.
+        if (player->FindMap() != pPlayer->FindMap())
+        {
+            player->GetSession()->SendPacket(&data);
+            continue;
+        }
+
+        if (!player->IsInVisibleList(pPlayer))
+            player->GetSession()->SendPacket(&data);
+    }
 }
 
 void Group::UpdatePlayerOnlineStatus(Player* player, bool online /*= true*/)
@@ -1823,7 +1897,7 @@ bool Group::_setMainTank(ObjectGuid guid)
     m_mainTankGuid = guid;
 
     if (!isBGGroup())
-        CharacterDatabase.PExecute("UPDATE groups SET mainTank='%u' WHERE groupId='%u'", m_mainTankGuid.GetCounter(), m_Id);
+        CharacterDatabase.PExecute("UPDATE `groups` SET mainTank='%u' WHERE groupId='%u'", m_mainTankGuid.GetCounter(), m_Id);
 
     return true;
 }
@@ -1846,7 +1920,7 @@ bool Group::_setMainAssistant(ObjectGuid guid)
     m_mainAssistantGuid = guid;
 
     if (!isBGGroup())
-        CharacterDatabase.PExecute("UPDATE groups SET mainAssistant='%u' WHERE groupId='%u'",
+        CharacterDatabase.PExecute("UPDATE `groups` SET mainAssistant='%u' WHERE groupId='%u'",
                                    m_mainAssistantGuid.GetCounter(), m_Id);
 
     return true;

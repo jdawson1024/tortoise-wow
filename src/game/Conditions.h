@@ -23,6 +23,13 @@
 
 #include "SharedDefines.h"
 
+// Without the precompiled header (USE_PCH=OFF - the usual escape from MSVC's
+// PCH size limits) nothing above declares these before ConditionEntry uses
+// them in signatures: 2026-09-04, Windows build of CustomMerchantMgr.cpp,
+// C2061 "WorldObject"; the same on Linux without PCH.
+class WorldObject;
+class Map;
+
 enum ConditionType
 {
     //                                                      // Legend:
@@ -255,6 +262,9 @@ enum ConditionType
     CONDITION_STAND_STATE           = 60,                   // Checks the stand state of the target Unit.
                                                             // Requirement: Unit Target
                                                             // Value1: stand_state
+    CONDITION_LUNATIC               = 61,                   // Checks the player's Level One Lunatic challenge mode.
+                                                            // Requirement: Player Target
+                                                            // Value1: 0 = target player, 1 = target player and reward-distance group members
 };
 
 enum ConditionFlags

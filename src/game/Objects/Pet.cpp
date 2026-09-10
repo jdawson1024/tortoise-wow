@@ -32,6 +32,7 @@
 #include "CharacterDatabaseCache.h"
 #include "AuraRemovalMgr.h"
 #include "PerfStats.h"
+#include "ScriptObjects.h"
 
 //numbers represent minutes * 100 while happy (you get 100 loyalty points per min while happy)
 uint32 const LevelUpLoyalty[6] =
@@ -88,6 +89,10 @@ Pet::~Pet()
     --PerfStats::g_totalPets;
 }
 
+// cmangos compat: vendored bot module calls IsSpellReady(SpellEntry const&). Out-of-line
+// because SpellEntry's complete type isn't visible at the declaration in Pet.h.
+bool Pet::IsSpellReady(SpellEntry const& spellInfo) const { return !HasSpellCooldown(spellInfo.Id); }
+
 void Pet::AddToWorld()
 {
     ///- Register the pet for guid lookup
@@ -95,6 +100,11 @@ void Pet::AddToWorld()
         GetMap()->InsertObject<Pet>(GetObjectGuid(), this);
 
     Unit::AddToWorld();
+
+    ScriptRegistry<PetScript>::ForEach([&](PetScript* script)
+    {
+        script->OnPetAddToWorld(this);
+    });
 
     // Prevent stuck pets when zoning. Pets default to "follow" when added to world
     // so we'll reset flags and let the AI handle things
@@ -110,6 +120,14 @@ void Pet::AddToWorld()
 
 void Pet::RemoveFromWorld()
 {
+    if (IsInWorld())
+    {
+        ScriptRegistry<PetScript>::ForEach([&](PetScript* script)
+        {
+            script->OnPetRemoveFromWorld(this);
+        });
+    }
+
     ///- Remove the pet from the accessor
     if (IsInWorld())
         GetMap()->EraseObject<Pet>(GetObjectGuid());
@@ -508,8 +526,8 @@ void Pet::SavePetToDB(PetSaveMode mode)
         uint32 curmana = GetPower(POWER_MANA);
 
         // stable and not in slot saves
-        if ( (mode != PET_SAVE_AS_CURRENT && getPetType() != HUNTER_PET) ||
-              mode == PET_SAVE_FIRST_STABLE_SLOT || mode == PET_SAVE_LAST_STABLE_SLOT )
+        if ((mode != PET_SAVE_AS_CURRENT && getPetType() != HUNTER_PET) ||
+            (mode >= PET_SAVE_FIRST_STABLE_SLOT && mode <= PET_SAVE_LAST_STABLE_SLOT))
             RemoveAllAuras();
 
         //save pet's data as one single transaction
@@ -1163,7 +1181,7 @@ void Pet::Unsummon(PetSaveMode mode, Unit* owner /*= nullptr*/)
                     }
                 }
             }
-            else if (mode == PET_SAVE_AS_DELETED || mode == PET_SAVE_FIRST_STABLE_SLOT || mode == PET_SAVE_LAST_STABLE_SLOT)
+            else if (mode == PET_SAVE_AS_DELETED || (mode >= PET_SAVE_FIRST_STABLE_SLOT && mode <= PET_SAVE_LAST_STABLE_SLOT))
             {
                 // Do not rez the pet in BG
                 p_owner->m_petEntry = 0;

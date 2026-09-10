@@ -32,12 +32,29 @@ set(CMAKE_MODULE_PATH
   ${CMAKE_SOURCE_DIR}/cmake
 )
 
+include(ConfigureModules)
+
 set(SUPPORTED_CLIENT_BUILD "CLIENT_BUILD_1_12_1" CACHE STRING "Client version the core will support")
 option(USE_STD_MALLOC "Use standard malloc instead of TBB" ON)
 option(TBB_DEBUG "Use TBB debug librairies" OFF)
 option(USE_ANTICHEAT "Use anticheat" ON)
 option(USE_DISCORD_BOT "Use Discord Bot" OFF)
 option(USE_SCRIPTS "Compile scripts" ON)
+option(BUILD_ELUNA "Build the Eluna Lua scripting engine" ON)
+option(BUILD_ELUNA_TESTS "Build the Eluna Lua runtime smoke test" ON)
+set(ELUNA_LUA_VERSION "lua52" CACHE STRING "Lua runtime used by Eluna (lua51, lua52, lua53, or lua54)")
+set_property(CACHE ELUNA_LUA_VERSION PROPERTY STRINGS lua51 lua52 lua53 lua54)
+
+if(BUILD_ELUNA)
+  if(NOT EXISTS "${CMAKE_SOURCE_DIR}/src/modules/Eluna/LuaEngine.h")
+    message(FATAL_ERROR
+      "Eluna submodule is missing. Run: git submodule update --init --recursive src/modules/Eluna")
+  endif()
+  if(BUILD_ELUNA_TESTS)
+    enable_testing()
+  endif()
+endif()
+set(MODULES "disabled" CACHE STRING "Module build mode: disabled, static, dynamic, or default.")
 option(USE_EXTRACTORS "Compile extractors" OFF)
 option(USE_TRACY "Use Tracy Profiling" OFF)
 option(USE_LIBCURL "Compile with libcurl for email support" OFF)
@@ -45,9 +62,37 @@ option(USE_REALMMERGE "Compile helper tool for merging character databases" OFF)
 option(USE_ADDRESS_SANITIZER "Enable clang address sanitizer - debug feature that slowing down server, but allow to catch memory corruption" OFF)
 option(ENABLE_PROFILING "(Windows only) Enable Optick integration, which allows to profile CPU and Memory. Also disabling some async code" OFF)
 option(ENABLE_LSAN "Enables Leak Sanitizer" OFF)
+option(ENABLE_LTO "Enable link-time optimization for release builds" ON)
+option(PROFILE_GENERATE "Build an instrumented release binary for profile-guided optimization" OFF)
+option(PROFILE_USE "Optimize a release binary using collected profile data" OFF)
+if(PROFILE_GENERATE AND PROFILE_USE)
+  message(FATAL_ERROR "PROFILE_GENERATE and PROFILE_USE cannot both be enabled")
+endif()
 # Allow enabling official Turtle addon support
 option(ALLOW_TURTLE_ADDONS "Allow Turtle addons" ON)
+# Build cmangos/playerbots — bot AI vendored under src/modules/PlayerBots/.
+# When ON, mangosd links the bot subsystem; runtime activation is gated by
+# AiPlayerbot.Enabled in aiplayerbot.conf.
+option(BUILD_PLAYERBOTS "Build the cmangos/playerbots subsystem" OFF)
+# BUILD_PLAYERBOTS without any module build leaves the host's playerbot hooks
+# undefined at link time: PlayerbotStubs.cpp is only compiled when the
+# subsystem is OFF, and the real World::InitPlayerbotsAtStartup, the .bot /
+# .ahbot / .perfmon chat handlers and BotActionLog_* live in
+# modules/mod-playerbots. A from-scratch Linux build with the documented cmake
+# line (no -DMODULES) died exactly there (2026-09-05). The subsystem IS a
+# module, so switch the module build on for it.
+if(BUILD_PLAYERBOTS AND MODULES STREQUAL "disabled")
+  # Enable ONLY the requested subsystem, not every optional module. Changing
+  # MODULES globally also activates DungeonClear and adds a mandatory config
+  # file to existing deployments that previously ran just mod-playerbots.
+  if(NOT DEFINED MODULE_MOD_PLAYERBOTS OR MODULE_MOD_PLAYERBOTS STREQUAL "default")
+    set(MODULE_MOD_PLAYERBOTS "static" CACHE STRING "Build mode for mod-playerbots" FORCE)
+  elseif(MODULE_MOD_PLAYERBOTS STREQUAL "disabled")
+    message(FATAL_ERROR "BUILD_PLAYERBOTS=ON conflicts with MODULE_MOD_PLAYERBOTS=disabled")
+  endif()
+endif()
 
+ConfigureModuleBuildOptions()
 
 if(UNIX)
   option(DEBUG_SYMBOLS "Include Debug Symbols" ON)
@@ -83,6 +128,7 @@ if(USE_LIBCURL)
   find_package(CURL REQUIRED)
   #add_definitions(-D_HAS_AUTO_PTR_ETC) # for VS2017 ACE support, won't do any harm to other compilers
   #set(CMAKE_CXX_STANDARD 17)
+
   #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++17")
 endif()
 
@@ -96,11 +142,34 @@ endif()
 
 # Giperion: Enable C++17
 set(CMAKE_CXX_STANDARD 17)
+
+# Detour: virtual query filters. Off, dtQueryFilter::getCost is non-virtual and
+# a derived filter (mod-dungeon-clear routes around no-go zones with one) would
+# compile against the base and silently never be called - paths would ignore
+# every zone the filter exists to avoid. Global on purpose: every translation
+# unit that includes DetourNavMeshQuery.h must agree on the class layout, or
+# this is an ODR break. Costs a virtual call per polygon test in all
+# pathfinding; AzerothCore ships with exactly this on.
+add_definitions(-DDT_VIRTUAL_QUERYFILTER=1)
+
 if(MSVC)
+# Do NOT append compiler flags here expecting them to survive. Further down,
+# the WIN32 branch does
+#     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS_RELEASE} /wd4996 ... /MP /EHsc")
+# which expands CMAKE_CXX_FLAGS_RELEASE, not CMAKE_CXX_FLAGS, and therefore
+# REPLACES everything set up here. I put /DDT_VIRTUAL_QUERYFILTER=1 on this
+# line on 2026-09-02 and it was silently discarded; gabtorman found the real
+# cause and moved it onto that later assignment, where it belongs. The
+# /std:c++17 below is likewise dropped there - harmless, since
+# CMAKE_CXX_STANDARD 17 above already covers it.
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++17")
 endif(MSVC)
 if(NOT MSVC)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
+# The Detour virtual-filter switch rides the same flags line the C++ standard
+# does: add_definitions provably does not survive to the subdirectory targets
+# in this tree (checked in flags.make), this line provably does.
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DDT_VIRTUAL_QUERYFILTER=1")
 endif()
 # Giperion: Set Edit and Continue by default for all windows debug builds
 if(MSVC AND NOT USE_ADDRESS_SANITIZER)
@@ -267,9 +336,29 @@ if(WIN32)
   set(MYSQL_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/dep/windows/include/mysql)
   set(MYSQL_LIBRARY ${CMAKE_SOURCE_DIR}/dep/windows/lib/${DEP_ARCH}_release/libmySQL.lib)
   set(MYSQL_DEBUG_LIBRARY ${CMAKE_SOURCE_DIR}/dep/windows/lib/${DEP_ARCH}_debug/libmySQL.lib)
-  set(OPENSSL_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/dep/windows/include/openssl)
-  set(OPENSSL_LIBRARIES ${CMAKE_SOURCE_DIR}/dep/windows/lib/${DEP_ARCH}_release/libssl.lib ${CMAKE_SOURCE_DIR}/dep/windows/lib/${DEP_ARCH}_release/libcrypto.lib)
-  set(OPENSSL_DEBUG_LIBRARIES ${CMAKE_SOURCE_DIR}/dep/windows/lib/${DEP_ARCH}_debug/libssl.lib ${CMAKE_SOURCE_DIR}/dep/windows/lib/${DEP_ARCH}_debug/libcrypto.lib)
+  # The bundled OpenSSL is 1.1.1, headers and import libraries together, and it
+  # works as long as nothing else puts OpenSSL headers on the search path. That
+  # stops being true the moment ACE or Boost come from vcpkg: its shared include
+  # root carries OpenSSL 3.x, which shadows the bundled headers because
+  # ACE_INCLUDE_DIR is listed before dep/include-windows in src/game and
+  # src/shared. Compiling against 3.x while still linking 1.1.1 leaves exactly
+  # OSSL_PROVIDER_load and SSL_get1_peer_certificate unresolved - both of them
+  # guarded by version in the code, so they are only referenced when the headers
+  # say 3.x.
+  #
+  # Hence: let the builder point at their own OpenSSL. The code itself is happy
+  # with either version. Passing nothing keeps the bundled copy, as before.
+  if(NOT OPENSSL_INCLUDE_DIR)
+    set(OPENSSL_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/dep/windows/include/openssl)
+  endif()
+  if(NOT OPENSSL_LIBRARIES)
+    set(OPENSSL_LIBRARIES ${CMAKE_SOURCE_DIR}/dep/windows/lib/${DEP_ARCH}_release/libssl.lib ${CMAKE_SOURCE_DIR}/dep/windows/lib/${DEP_ARCH}_release/libcrypto.lib)
+    # Remembered so the install step knows whether to ship the matching runtime.
+    set(USING_BUNDLED_OPENSSL TRUE)
+  endif()
+  if(NOT OPENSSL_DEBUG_LIBRARIES)
+    set(OPENSSL_DEBUG_LIBRARIES ${CMAKE_SOURCE_DIR}/dep/windows/lib/${DEP_ARCH}_debug/libssl.lib ${CMAKE_SOURCE_DIR}/dep/windows/lib/${DEP_ARCH}_debug/libcrypto.lib)
+  endif()
   set(ZLIB_INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/dep/windows/include/zlib)
 
   set(OPTICK_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/dep/include/optick)
@@ -352,7 +441,7 @@ endif()
 if(PROFILE_GENERATE)
   message(STATUS "PGO profile           : Generate")
 elseif(PROFILE_USE)
-  message(STATUS "PGO profile           : ${GCC_PROFILE_USE}")
+  message(STATUS "PGO profile           : Use")
 else()
   message(STATUS "PGO profile           : Disabled")
 endif()
@@ -382,6 +471,33 @@ if(USE_SCRIPTS)
   message(STATUS "Build scripts         : Yes (default)")
 else()
   message(STATUS "Build scripts         : No")
+endif()
+
+if(BUILD_ELUNA)
+  message(STATUS "Build Eluna           : Yes (Lua ${ELUNA_LUA_VERSION})")
+else()
+  message(STATUS "Build Eluna           : No")
+endif()
+
+if(MODULES_MODULE_LIST)
+  message(STATUS "Build modules         : ${MODULES}")
+  foreach(SOURCE_MODULE ${MODULES_MODULE_LIST})
+    ModuleNameToVariable("${SOURCE_MODULE}" MODULE_VARIABLE)
+    if("${${MODULE_VARIABLE}}" STREQUAL "default")
+      set(MODULE_EFFECTIVE_LINKAGE "${MODULES_DEFAULT_LINKAGE}")
+    else()
+      set(MODULE_EFFECTIVE_LINKAGE "${${MODULE_VARIABLE}}")
+    endif()
+    message(STATUS "  ${SOURCE_MODULE}: ${MODULE_EFFECTIVE_LINKAGE} (${MODULE_VARIABLE}=${${MODULE_VARIABLE}})")
+  endforeach()
+else()
+  message(STATUS "Build modules         : ${MODULES} (no modules found)")
+endif()
+
+if(MODULES_DYNAMIC_LINKING_REQUIRED)
+  message(STATUS "Module dynamic linking: Required")
+else()
+  message(STATUS "Module dynamic linking: Not required")
 endif()
 
 if(USE_DISCORD_BOT)
@@ -452,7 +568,10 @@ elseif(WIN32)
   # Disable warnings in Visual Studio 8 and above and add /MP
   if(MSVC AND NOT CMAKE_GENERATOR MATCHES "Visual Studio 7")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS_RELEASE} /wd4996 /wd4355 /wd4244 /wd4985 /wd4267 /MP /EHsc")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS_RELEASE} /wd4996 /wd4355 /wd4244 /wd4267 /MP /EHsc")
+    # This assignment replaces the earlier CMAKE_CXX_FLAGS value. Keep the
+    # virtual-query-filter switch here too, so Detour and every consumer agree
+    # on dtQueryFilter's layout and DcRouteFilter can override getCost.
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS_RELEASE} /wd4996 /wd4355 /wd4244 /wd4267 /MP /EHsc /DDT_VIRTUAL_QUERYFILTER=1")
   endif()
 endif()
 
@@ -467,6 +586,35 @@ if(MSVC)
   #endif()
   
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /bigobj")
+
+  # Release builds carry debug information too. The server installs a crash
+  # handler that writes a minidump, and without a .pdb every frame in it is a
+  # bare address - the one file meant to explain a crash explains nothing.
+  # /OPT:REF and /OPT:ICF are here because /DEBUG turns them off by default;
+  # with them the generated binary is the same as before, there is simply a
+  # .pdb beside it.
+  set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /Zi")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /Zi")
+
+  if(ENABLE_LTO OR PROFILE_GENERATE OR PROFILE_USE)
+    set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /GL")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /GL")
+  endif()
+
+  foreach(_linker EXE SHARED MODULE)
+    set(CMAKE_${_linker}_LINKER_FLAGS_RELEASE
+        "${CMAKE_${_linker}_LINKER_FLAGS_RELEASE} /DEBUG /OPT:REF /OPT:ICF")
+    if(PROFILE_GENERATE)
+      set(CMAKE_${_linker}_LINKER_FLAGS_RELEASE
+          "${CMAKE_${_linker}_LINKER_FLAGS_RELEASE} /LTCG:PGINSTRUMENT /GENPROFILE")
+    elseif(PROFILE_USE)
+      set(CMAKE_${_linker}_LINKER_FLAGS_RELEASE
+          "${CMAKE_${_linker}_LINKER_FLAGS_RELEASE} /LTCG:PGOPTIMIZE /USEPROFILE")
+    elseif(ENABLE_LTO)
+      set(CMAKE_${_linker}_LINKER_FLAGS_RELEASE
+          "${CMAKE_${_linker}_LINKER_FLAGS_RELEASE} /LTCG")
+    endif()
+  endforeach()
 endif()
 
 set(CMAKE_SKIP_BUILD_RPATH FALSE)
@@ -489,6 +637,36 @@ if(WIN32)
     DESTINATION ${LIBS_DIR}
     CONFIGURATIONS Debug
   )
+
+  # libeay32.dll above is the OpenSSL 1.0 runtime, but what actually gets linked
+  # is libssl.lib and libcrypto.lib - the 1.1 import libraries, whose runtime is
+  # named libssl-1_1[-x64].dll and libcrypto-1_1[-x64].dll. Both sit in the same
+  # directory; the wrong pair was simply picked, so a freshly installed server
+  # could not find its OpenSSL at all. Shipped only when the bundled copy is in
+  # use - anyone pointing OPENSSL_LIBRARIES at their own build brings their own.
+  if(USING_BUNDLED_OPENSSL)
+    if(DEP_ARCH STREQUAL "x64")
+      set(BUNDLED_SSL_SUFFIX "-x64")
+    else()
+      set(BUNDLED_SSL_SUFFIX "")
+    endif()
+    install(
+      FILES
+        ${CMAKE_SOURCE_DIR}/dep/windows/lib/${DEP_ARCH}_release/libssl-1_1${BUNDLED_SSL_SUFFIX}.dll
+        ${CMAKE_SOURCE_DIR}/dep/windows/lib/${DEP_ARCH}_release/libcrypto-1_1${BUNDLED_SSL_SUFFIX}.dll
+      DESTINATION ${LIBS_DIR}
+      CONFIGURATIONS Release
+      OPTIONAL
+    )
+    install(
+      FILES
+        ${CMAKE_SOURCE_DIR}/dep/windows/lib/${DEP_ARCH}_debug/libssl-1_1${BUNDLED_SSL_SUFFIX}.dll
+        ${CMAKE_SOURCE_DIR}/dep/windows/lib/${DEP_ARCH}_debug/libcrypto-1_1${BUNDLED_SSL_SUFFIX}.dll
+      DESTINATION ${LIBS_DIR}
+      CONFIGURATIONS Debug
+      OPTIONAL
+    )
+  endif()
   if(PLATFORM MATCHES X86)
     # Copy dll's Windows needs
     install(
@@ -520,6 +698,7 @@ endif()
 set(DEFINITIONS
   ${DEFINITIONS}
   DO_MYSQL
+  TW_SOURCE_MODULES_DIR="${CMAKE_SOURCE_DIR}/modules"
 )
 
 if(WIN32)
@@ -528,6 +707,13 @@ if(WIN32)
 else()
   set(DEFINITIONS ${DEFINITIONS} SYSCONFDIR="${CONF_DIR}/")
 endif()
+
+if(TW_MODULE_CONFIG_LIST)
+  string(REPLACE ";" "," TW_MODULE_CONFIG_LIST_CSV "${TW_MODULE_CONFIG_LIST}")
+else()
+  set(TW_MODULE_CONFIG_LIST_CSV "")
+endif()
+set(DEFINITIONS ${DEFINITIONS} TW_MODULE_CONFIG_LIST="${TW_MODULE_CONFIG_LIST_CSV}")
 
 if(USE_STD_MALLOC)
   set(DEFINITIONS ${DEFINITIONS} USE_STANDARD_MALLOC)
@@ -548,10 +734,55 @@ set_property(DIRECTORY APPEND PROPERTY
 message(STATUS "Build flags (RELEASE) : ${CMAKE_CXX_FLAGS_RELEASE}")
 message(STATUS "Build flags (DEBUG)   : ${CMAKE_CXX_FLAGS_DEBUG}")
 
-
+if(MSVC)
+    add_compile_definitions(_USE_MATH_DEFINES)
+endif()
 add_subdirectory(src)
 add_subdirectory(dep)
+add_subdirectory(modules)
 
+if(TARGET mangosd AND TARGET modules)
+  target_link_libraries(mangosd modules)
+endif()
+
+if(TARGET mangosd AND TARGET modules_playerbots)
+  target_link_libraries(mangosd modules_playerbots)
+endif()
+
+if(TARGET mangosd AND WORLDSERVER_DYNAMIC_MODULES_DEPENDENCIES)
+  add_dependencies(mangosd ${WORLDSERVER_DYNAMIC_MODULES_DEPENDENCIES})
+endif()
+
+if(TARGET mangosd)
+  if(WORLDSERVER_DYNAMIC_MODULES)
+    string(REPLACE ";" "," TW_DYNAMIC_MODULES_CSV "${WORLDSERVER_DYNAMIC_MODULES}")
+  else()
+    set(TW_DYNAMIC_MODULES_CSV "")
+  endif()
+
+  if(WORLDSERVER_ENABLED_MODULES)
+    string(REPLACE ";" "," TW_ENABLED_MODULES_CSV "${WORLDSERVER_ENABLED_MODULES}")
+  else()
+    set(TW_ENABLED_MODULES_CSV "")
+  endif()
+
+  target_compile_definitions(mangosd
+    PRIVATE
+      TW_DYNAMIC_MODULES="${TW_DYNAMIC_MODULES_CSV}"
+      TW_MODULES_BUILD_DIRECTIVE="${CMAKE_BUILD_TYPE}"
+      TW_DYNAMIC_MODULES_INSTALL_DIR="${MODULES_INSTALL_RUNTIME_DIR}")
+
+  if(TARGET shared)
+    target_compile_definitions(shared
+      PRIVATE
+        TW_ENABLED_MODULES="${TW_ENABLED_MODULES_CSV}")
+  endif()
+endif()
+
+# cmangos/playerbots is a MODULE now: modules/mod-playerbots.
+# Its build lives in that module's own CMakeLists.txt and
+# mod-playerbots.cmake. BUILD_PLAYERBOTS still switches it on and off,
+# and still gates src/game/PlayerbotStubs.cpp.
 
 if (USE_EXTRACTORS OR USE_REALMMERGE)
     add_subdirectory(tools)

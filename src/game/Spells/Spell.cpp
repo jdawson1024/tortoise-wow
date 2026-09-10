@@ -3,6 +3,7 @@
  * Copyright (C) 2009-2011 MaNGOSZero <https://github.com/mangos/zero>
  * Copyright (C) 2011-2016 Nostalrius <https://nostalrius.org>
  * Copyright (C) 2016-2017 Elysium Project <https://github.com/elysium-project>
+ * Copyright (C) vMaNGOS contributors <https://github.com/vmangos/core>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -35,6 +36,7 @@
 #include "ScriptMgr.h"
 #include "Player.h"
 #include "Pet.h"
+#include "Totem.h"
 #include "DynamicObject.h"
 #include "Group.h"
 #include "UpdateData.h"
@@ -55,6 +57,7 @@
 #include "Unit.h"
 #include "MountManager.hpp"
 #include "CompanionManager.hpp"
+#include "ScriptObjects.h"
 
 #include <memory>
 
@@ -1445,6 +1448,8 @@ void Spell::DoAllEffectOnTarget(TargetInfo *target)
         }
 
         int32 gain = pCaster->DealHeal(unitTarget, addhealth, m_spellInfo, crit);
+        if (m_spellScript)
+            m_spellScript->OnAfterHeal(this, unitTarget, addhealth, gain, crit);
 
         float classThreatModifier = pRealUnitCaster && pRealUnitCaster->GetClass() == CLASS_PALADIN ? 0.25f : 0.5f;
 
@@ -3676,6 +3681,12 @@ SpellCastResult Spell::prepare(Aura* triggeredByAura, uint32 chance)
 
 void Spell::cancel()
 {
+    // Player-cast, object-originated = a summoning ritual's spell (the altar).
+    // The caster check keeps battleground flag spells (cast BY the object) out.
+    if (m_originalCasterGUID.IsGameObject() && m_caster && m_caster->IsPlayer())
+        sLog.outInfo("[GO] spell %u for %s cancelled in state %u by caster %s",
+                     m_spellInfo->Id, m_originalCasterGUID.GetString().c_str(), uint32(m_spellState),
+                     m_caster ? m_caster->GetName() : "?");
     if (m_spellState == SPELL_STATE_FINISHED)
         return;
 
@@ -3763,6 +3774,15 @@ void Spell::cancel()
 
 void Spell::cast(bool skipCheck)
 {
+    // BotActionLog hook: cast start. Logged BEFORE the MAX_SPELL_ID guard
+    // so even rejected casts show up.
+    {
+        extern void BotActionLog_LogCastStart(WorldObject* caster, uint32 spellId, uint64 targetGuidRaw, uint32 castTimeMs);
+        ObjectGuid tgt = m_targets.getUnitTargetGuid();
+        if (!tgt) tgt = m_targets.getGOTargetGuid();
+        BotActionLog_LogCastStart(m_caster, m_spellInfo->Id, tgt.GetRawValue(), m_casttime);
+    }
+
     if (m_spellInfo->Id <= 0 || m_spellInfo->Id > MAX_SPELL_ID)
         return;
 
@@ -3867,6 +3887,14 @@ void Spell::cast(bool skipCheck)
 
     if (m_spellScript)
         m_spellScript->OnCast(this);
+
+    if (Player* playerCaster = m_caster->ToPlayer())
+    {
+        ScriptRegistry<PlayerScript>::ForEachEnabledHook(PLAYERHOOK_ON_SPELL_CAST, [&](PlayerScript* script)
+        {
+            script->OnSpellCast(playerCaster, this, skipCheck);
+        });
+    }
 
     // CAST SPELL
     // Remove any remaining invis auras on cast completion, should only be gnomish cloaking device
@@ -4228,8 +4256,15 @@ void Spell::update(uint32 difftime)
             // triggered spell
             if (pGo->GetGoType() == GAMEOBJECT_TYPE_SUMMONING_RITUAL &&
                 m_spellInfo->Id == pInfo->summoningRitual.spellId &&
-                // too many helpers cancelled
-                (pGo->GetUniqueUseCount() < pInfo->summoningRitual.reqParticipants ||
+                // too many helpers cancelled. Only for a summoner's own, temporary
+                // ritual (warlock portal): a PERSISTENT world altar with no owner
+                // (Uldaman's Altar of the Keepers / of Archaedas, 130511 / 133234)
+                // fires on the third click and must not depend on the clickers
+                // keeping their channel visual up for the 5 s cast - bot clickers
+                // drop it within ~200 ms and every ritual was cancelled in the
+                // same second it completed (19 of 19 on 2026-09-04).
+                ((!pInfo->summoningRitual.ritualPersistent &&
+                  pGo->GetUniqueUseCount() < pInfo->summoningRitual.reqParticipants) ||
                 // the warlock cancelled
                 (!pInfo->summoningRitual.ritualPersistent && !pGo->GetOwner())))
             {
@@ -4432,6 +4467,7 @@ void Spell::HandleAddTargetTriggerAuras()
             // Calculate chance at that moment (can be depend for example from combo points)
             int32 auraBasePoints = targetTrigger->GetBasePoints();
             int32 chance = m_casterUnit->CalculateSpellDamage(target, auraSpellInfo, auraSpellIdx, &auraBasePoints);
+
             if ((m_casterUnit->IsPlayer() && m_casterUnit->ToPlayer()->HasOption(PLAYER_CHEAT_ALWAYS_PROC)) || roll_chance_i(chance))
                 m_casterUnit->CastSpell(target, triggerSpellInfo, true, nullptr, targetTrigger);
         }
@@ -4440,6 +4476,14 @@ void Spell::HandleAddTargetTriggerAuras()
 
 void Spell::finish(bool ok)
 {
+    // Rituals: the altar spell (a real cast with cast time, e.g. Uldaman's
+    // 11568) is fired through GameObject::Use with the object as original
+    // caster. With bot parties it completed and nothing followed; name the
+    // cast that ended without its effects (2026-09-04).
+    if (!ok && m_originalCasterGUID.IsGameObject() && m_caster && m_caster->IsPlayer())
+        sLog.outInfo("[GO] spell %u for %s ended without effect: state %u, caster %s, casttime %d",
+                     m_spellInfo->Id, m_originalCasterGUID.GetString().c_str(), uint32(m_spellState),
+                     m_caster ? m_caster->GetName() : "?", m_casttime);
     m_successCast = ok;
 
     if (!m_caster)
@@ -4449,6 +4493,13 @@ void Spell::finish(bool ok)
         return;
 
     m_spellState = SPELL_STATE_FINISHED;
+
+    // BotActionLog hook: cast result. `ok` is true on success,
+    // false on cancel/interrupt/fail.
+    {
+        extern void BotActionLog_LogCastResult(WorldObject* caster, uint32 spellId, uint8 result, const char* phase);
+        BotActionLog_LogCastResult(m_caster, m_spellInfo->Id, ok ? 0 : 1, "finish");
+    }
 
     // Clear the creature's casting target so it faces victim
     if (m_setCreatureTarget)
@@ -4502,7 +4553,14 @@ void Spell::finish(bool ok)
             }
         }
         if (needDrop)
-            ((Player*)m_caster)->ClearComboPoints();
+        {
+            Player* player = (Player*)m_caster;
+            uint8 const comboPoints = player->GetComboPoints();
+            if (comboPoints && m_spellScript)
+                m_spellScript->OnComboPointsSpent(this, comboPoints);
+
+            player->ClearComboPoints();
+        }
     }
 
     // call triggered spell only at successful cast (after clear combo points -> for add some if need)
@@ -5329,6 +5387,9 @@ void Spell::TakeAmmo()
     if (!pCaster)
         return;
 
+    if (m_spellScript && !m_spellScript->OnTakeAmmo(this))
+        return;
+
     // Some ranged attacks dont take any ammo
     switch (m_spellInfo->Id)
     {
@@ -5336,6 +5397,7 @@ void Spell::TakeAmmo()
         case 13099: // Net-o-Matic
         case 13119: // Net-o-Matic
         case 23577: // Expose Weakness
+        case 51514: // Piercing Shots
             return;
     }
             
@@ -5509,7 +5571,8 @@ SpellCastResult Spell::CheckCast(bool strict)
         return SPELL_CAST_OK;
 
     // Prevent casting while sitting unless the spell allows it
-    if (!m_IsTriggeredSpell && m_casterUnit && !m_casterUnit->IsStandingUp() && !(m_spellInfo->Attributes & SPELL_ATTR_CASTABLE_WHILE_SITTING))
+    if (!m_IsTriggeredSpell && m_casterUnit && !m_casterUnit->IsStandingUp() &&
+            !(m_spellInfo->Attributes & SPELL_ATTR_CASTABLE_WHILE_SITTING) && !m_spellInfo->HasEffect(SPELL_EFFECT_LEARN_SPELL))
         return SPELL_FAILED_NOT_STANDING;
     
     /*  Check cooldowns to prevent cheating (ignore passive spells, that client side visual only)
@@ -5574,7 +5637,8 @@ SpellCastResult Spell::CheckCast(bool strict)
 
         if (strict && m_casterUnit)
         {
-            if (m_casterUnit && m_casterUnit->IsInCombat() && m_spellInfo->IsNonCombatSpell())
+            if (m_casterUnit && m_casterUnit->IsInCombat() && m_spellInfo->IsNonCombatSpell() &&
+                    (!m_spellScript || !m_spellScript->OnCanCastNonCombatSpellInCombat(this)))
                 return SPELL_FAILED_AFFECTING_COMBAT;
 
             // only check at first call, Stealth auras are already removed at second call
@@ -5617,16 +5681,6 @@ SpellCastResult Spell::CheckCast(bool strict)
             if ((!m_caster->m_movementInfo.HasMovementFlag(MOVEFLAG_FALLINGFAR) || m_spellInfo->Effect[EFFECT_INDEX_0] != SPELL_EFFECT_STUCK) &&
                     (IsAutoRepeat() || m_spellInfo->AuraInterruptFlags & AURA_INTERRUPT_FLAG_NOT_SEATED))
                 return SPELL_FAILED_MOVING;
-        }
-
-        //CUSTOM Aspect of the wolf can not use ranged attacks.
-        if (m_caster->ToPlayer()->HasAura(45650))
-        {
-            if (m_spellInfo->IsAutoRepeatRangedSpell() || (m_spellInfo->Attributes & SPELL_ATTR_RANGED))
-            {
-                m_caster->ToPlayer()->GetSession()->SendNotification("Can\'t use that in this Aspect.");
-                return SPELL_FAILED_DONT_REPORT;
-            }
         }
 
         if (!m_IsTriggeredSpell && m_spellInfo->NeedsComboPoints() && Spells::IsExplicitlySelectedUnitTarget(m_spellInfo->EffectImplicitTargetA[0]) &&
@@ -6077,9 +6131,10 @@ SpellCastResult Spell::CheckCast(bool strict)
                     return SPELL_FAILED_DONT_REPORT;
                 }
 
+                // Penqle's GetSession()->GetBot() guard removed (stub binned).
+                // cmangos's bot guard relies on isRealPlayer(); not needed here.
                 if (plrCaster->GetPetGuid() || plrCaster->GetCharmGuid() ||
-                   (!plrCaster->GetSession()->GetBot() &&
-                    sCharacterDatabaseCache.GetCharacterPetByOwner(plrCaster->GetGUIDLow())))
+                    sCharacterDatabaseCache.GetCharacterPetByOwner(plrCaster->GetGUIDLow()))
                 {
                     plrCaster->SendPetTameFailure(PETTAME_ANOTHERSUMMONACTIVE);
                     return SPELL_FAILED_DONT_REPORT;
@@ -7058,7 +7113,7 @@ SpellCastResult Spell::CheckRange(bool strict)
                         range_mod += modOwner->ApplySpellMod(m_spellInfo->Id, SPELLMOD_RANGE, base, this);
                     }
 
-                    range_mod += m_casterUnit->GetTotalAuraModifier(SPELL_AURA_MOD_ATTACK_AND_SPELL_RANGE) / 1000.0f / ATTACK_DISTANCE;
+                    range_mod += m_casterUnit->GetTotalAuraRangeModifier(SPELL_AURA_MOD_ATTACK_AND_SPELL_RANGE) / 1000.0f / ATTACK_DISTANCE;
                 }
                 
                 // with additional 5 dist for non stricted case (some melee spells have delay in apply
@@ -7081,7 +7136,7 @@ SpellCastResult Spell::CheckRange(bool strict)
         if (Player* modOwner = m_casterUnit->GetSpellModOwner())
             modOwner->ApplySpellMod(m_spellInfo->Id, SPELLMOD_RANGE, max_range, this);
 
-        max_range += m_casterUnit->GetTotalAuraModifier(SPELL_AURA_MOD_ATTACK_AND_SPELL_RANGE) / 1000.0f;
+        max_range += m_casterUnit->GetTotalAuraRangeModifier(SPELL_AURA_MOD_ATTACK_AND_SPELL_RANGE) / 1000.0f;
     }
 
     max_range += range_mod;
@@ -7493,6 +7548,10 @@ SpellCastResult Spell::CheckItems()
 
                 if (targetItem->GetProto()->ItemLevel < m_spellInfo->baseLevel)
                     return SPELL_FAILED_LOWLEVEL;
+
+                if (targetItem->CanBeTradedEvenIfSoulBound())
+                    return SPELL_FAILED_NOT_TRADEABLE;
+
                 // Not allow enchant in trade slot for some enchant type
                 if (targetItem->GetOwner() != m_caster)
                 {
@@ -7510,6 +7569,10 @@ SpellCastResult Spell::CheckItems()
                 Item *item = m_targets.getItemTarget();
                 if (!item)
                     return SPELL_FAILED_ITEM_GONE;
+
+                if (item->CanBeTradedEvenIfSoulBound())
+                    return SPELL_FAILED_NOT_TRADEABLE;
+
                 // Not allow enchant in trade slot for some enchant type
                 if (item->GetOwner() != m_caster)
                 {

@@ -1,6 +1,7 @@
 #include "SpellEntry.h"
 #include "SharedDefines.h"
 #include "SpellAuraDefines.h"
+#include "SpellAuras.h"
 #include "SpellMgr.h"
 #include "Spell.h"
 #include "ScriptMgr.h"
@@ -101,8 +102,9 @@ SpellSpecific Spells::GetSpellSpecific(uint32 spellId)
             if (spellInfo->Dispel == DISPEL_POISON)
                 return SPELL_STING;
 
-            // only hunter aspects have this (one have generic family), if exclude Auto Shot
-            if (spellInfo->activeIconID == 122 && spellInfo->Id != 75)
+            // only hunter aspects have this (one have generic family), if exclude Auto Shot and Trueshot Aura
+            if (spellInfo->activeIconID == 122 && spellInfo->Id != 75 &&
+                    spellInfo->Id != 19506 && spellInfo->Id != 20905 && spellInfo->Id != 20906)
                 return SPELL_ASPECT;
 
             break;
@@ -597,6 +599,26 @@ uint32 SpellEntry::GetCastTime(WorldObject* caster, Spell* spell) const
             {
                 castTime = int32(castTime * pUnit->m_modAttackSpeedPct[RANGED_ATTACK]);
             }
+
+            // Native skill-specific cast-time auras use EffectMiscValue as
+            // the skill ID. Match the existing spell/skill index; a spell
+            // with duplicate skill rows must apply each aura only once.
+            auto const& skillCastAuras = pUnit->GetAurasByType(SPELL_AURA_MOD_SKILL_CAST_TIME);
+            if (!skillCastAuras.empty())
+            {
+                auto const skillBounds = sSpellMgr.GetSkillLineAbilityMapBoundsBySpellId(Id);
+                for (Aura const* aura : skillCastAuras)
+                {
+                    for (auto itr = skillBounds.first; itr != skillBounds.second; ++itr)
+                    {
+                        if (int32(itr->second->skillId) == aura->GetModifier()->m_miscvalue)
+                        {
+                            castTime = int32(castTime * (100.0f + aura->GetModifier()->m_amount) / 100.0f);
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -823,7 +845,19 @@ int32 SpellEntry::CalculateDuration(WorldObject const* caster, Unit const* targe
         {
             if (Player* modOwner = pUnit->GetSpellModOwner())
             {
+                int32 const durationBeforeSpellMods = duration;
                 modOwner->ApplySpellMod(Id, SPELLMOD_DURATION, duration);
+
+                Unit::AuraList const& overrideClassScripts = modOwner->GetAurasByType(SPELL_AURA_OVERRIDE_CLASS_SCRIPTS);
+                for (Aura const* aura : overrideClassScripts)
+                {
+                    if (aura->GetModifier()->m_miscvalue != 5066 ||
+                        modOwner->HasAura(51578) ||
+                        !aura->isAffectedOnSpell(this))
+                        continue;
+
+                    duration += int32(durationBeforeSpellMods * aura->GetModifier()->m_amount / 100.0f);
+                }
 
                 if (duration < 0)
                     duration = 0;
@@ -1193,4 +1227,16 @@ bool SpellEntry::HasAuraOrTriggersAnotherSpellWithAura(AuraType aura) const
                     return true;
     }
     return false;
+}
+
+// See the declarations in the header: this core keeps spell distances in
+// SpellRange.dbc behind rangeIndex, not on the spell.
+float SpellEntry::GetMaxRange(bool /*positive*/) const
+{
+    return ::GetSpellMaxRange(sSpellRangeStore.LookupEntry(rangeIndex));
+}
+
+float SpellEntry::GetMinRange(bool /*positive*/) const
+{
+    return ::GetSpellMinRange(sSpellRangeStore.LookupEntry(rangeIndex));
 }

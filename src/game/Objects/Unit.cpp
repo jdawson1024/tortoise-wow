@@ -19,6 +19,7 @@
  */
 
 #include "Unit.h"
+#include "ArchitectureDiagnostics.h"
 #include "Log.h"
 #include "Opcodes.h"
 #include "WorldPacket.h"
@@ -32,6 +33,7 @@
 #include "Creature.h"
 #include "Spell.h"
 #include "ScriptMgr.h"
+#include "ScriptObjects.h"
 #include "Group.h"
 #include "SpellAuras.h"
 #include "SpellEntry.h"
@@ -73,6 +75,7 @@
 #include <stdarg.h>
 #include "SuspiciousStatisticMgr.h"
 #include "PerfStats.h"
+#include "AccountMgr.h"   // Leech restrictions: spotting RNDBOT accounts by name
 
 float baseMoveSpeed[MAX_MOVE_TYPE] =
 {
@@ -256,7 +259,15 @@ void Unit::Update(uint32 update_diff, uint32 p_time)
     if (!IsInWorld())
         return;
 
+    TurtleDiagnostics::CreatureProbe::Stage(this, TurtleDiagnostics::UnitHooks);
+    ScriptRegistry<UnitScript>::ForEachEnabledHook(UNITHOOK_ON_UNIT_UPDATE, [&](UnitScript* script)
+    {
+        script->OnUnitUpdate(this, update_diff);
+    });
+
+    TurtleDiagnostics::CreatureProbe::Stage(this, TurtleDiagnostics::UnitVisibility);
     CheckPendingVisibilityAndViewUpdate();
+    TurtleDiagnostics::CreatureProbe::Stage(this, TurtleDiagnostics::UnitCombat);
 
     // Nostalrius : systeme de contresort des mobs.
     // Boucle 1 pour regler les timers
@@ -282,11 +293,15 @@ void Unit::Update(uint32 update_diff, uint32 p_time)
     // WARNING! Order of execution here is important, do not change.
     // Spells must be processed with event system BEFORE they go to _UpdateSpells.
     // Or else we may have some SPELL_STATE_FINISHED spells stalled in pointers, that is bad.
+    TurtleDiagnostics::CreatureProbe::Stage(this, TurtleDiagnostics::UnitEvents);
     m_Events.Update(update_diff);
+    TurtleDiagnostics::CreatureProbe::Stage(this, TurtleDiagnostics::UnitSpells);
     _UpdateSpells(update_diff);
 
+    TurtleDiagnostics::CreatureProbe::Stage(this, TurtleDiagnostics::UnitAuraCleanup);
     CleanupDeletedAuras();    
 
+    TurtleDiagnostics::CreatureProbe::Stage(this, TurtleDiagnostics::UnitCombat);
     if (m_lastManaUseTimer)
     {
         if (update_diff >= m_lastManaUseTimer)
@@ -356,6 +371,7 @@ void Unit::Update(uint32 update_diff, uint32 p_time)
         SetAttackTimer(RANGED_ATTACK, (update_diff >= ranged_att ? 0 : ranged_att - update_diff));
 
     // update abilities available only for fraction of time
+    TurtleDiagnostics::CreatureProbe::Stage(this, TurtleDiagnostics::UnitReactives);
     UpdateReactives(update_diff);
 
     if (IsAlive())
@@ -364,9 +380,13 @@ void Unit::Update(uint32 update_diff, uint32 p_time)
         ModifyAuraState(AURA_STATE_HEALTHLESS_35_PERCENT, GetHealth() < GetMaxHealth() * 0.35f);
     }
 
+    TurtleDiagnostics::CreatureProbe::Stage(this, TurtleDiagnostics::UnitMovementChecks);
     CheckPendingMovementChanges();
+    TurtleDiagnostics::CreatureProbe::Stage(this, TurtleDiagnostics::UnitSpline);
     UpdateSplineMovement(p_time);
+    TurtleDiagnostics::CreatureProbe::Stage(this, TurtleDiagnostics::UnitMotion);
     GetMotionMaster()->UpdateMotion(p_time);
+    TurtleDiagnostics::CreatureProbe::Stage(this, TurtleDiagnostics::UnitDeferredMotion);
     if (GetMotionMaster()->NeedsAsyncUpdate() && IsInWorld())
     {
         if (sWorld.getConfig(CONFIG_UINT32_CONTINENTS_MOTIONUPDATE_THREADS) && GetMap()->IsContinent())
@@ -374,6 +394,7 @@ void Unit::Update(uint32 update_diff, uint32 p_time)
         else
             GetMotionMaster()->UpdateMotionAsync(p_time);
     }
+    TurtleDiagnostics::CreatureProbe::Stage(this, TurtleDiagnostics::UnitWorld);
     WorldObject::Update(update_diff, p_time);
     if (_delayedActions & OBJECT_DELAYED_ADD_TO_RELOCATED_LIST)
     {
@@ -388,6 +409,28 @@ void Unit::Update(uint32 update_diff, uint32 p_time)
     m_lastDamageTaken += p_time;
     if (m_lastDamageTaken > 60000)
         m_damageTakenHistory.clear();
+}
+
+// bot uses cmangos's IsInTeam(team) on Unit*.
+// Penqle only has Player::GetTeam(); for non-players default to Alliance team membership.
+bool Unit::IsInTeam(uint32 team, bool /*allowFFA*/) const
+{
+    if (Player const* p = ToPlayer())
+        return p->GetTeam() == team;
+    // Non-player units (creatures, totems, pets) — bot's PVP filters apply this to "enemy player" checks;
+    // treat as Alliance by default (the same fallback cmangos uses for non-team units).
+    return team == ALLIANCE;
+}
+
+// overload: same-team check between two units.
+bool Unit::IsInTeam(Unit const* other, bool allowFFA) const
+{
+    if (!other) return false;
+    Player const* p = ToPlayer();
+    Player const* o = other->ToPlayer();
+    if (p && o) return p->GetTeam() == o->GetTeam();
+    // If either is non-player, fall through to Alliance default.
+    return true;
 }
 
 bool Unit::UsesPvPCombatTimer() const
@@ -715,6 +758,32 @@ uint32 Unit::DealDamage(Unit* pVictim, uint32 damage, CleanDamage const* cleanDa
     if (pVictim && pVictim->IsPlayer() && pVictim->ToPlayer()->m_disableGeneralDamage == true)
         return 0;
 
+    // bot logging suite — hook damage events.
+    // Wrapper checks attacker AND victim for bot AI; non-bot ↔ non-bot
+    // case is two cheap pointer-null-checks. Sampled 1/5 to avoid spam
+    // in heavy-DoT raid scenarios.
+    {
+        extern void BotActionLog_LogDamage(Unit* attacker, Unit* victim, uint32 damage, uint32 spellId, const char* damageType);
+        const char* dt = "?";
+        switch (damagetype) {
+            case DIRECT_DAMAGE: dt = "DIRECT"; break;
+            case SPELL_DIRECT_DAMAGE: dt = "SPELL_DIRECT"; break;
+            case DOT: dt = "DOT"; break;
+            case HEAL: dt = "HEAL"; break;
+            case NODAMAGE: dt = "NODAMAGE"; break;
+            case SELF_DAMAGE: dt = "SELF"; break;
+        }
+        BotActionLog_LogDamage(this, pVictim, damage, spellProto ? spellProto->Id : 0, dt);
+    }
+
+    if (pVictim)
+    {
+        ScriptRegistry<UnitScript>::ForEachEnabledHook(UNITHOOK_ON_DAMAGE, [&](UnitScript* script)
+        {
+            script->OnDamage(this, pVictim, damage);
+        });
+    }
+
     // remove affects from attacker at any non-DoT damage (including 0 damage)
     if (damagetype != DOT)
     {
@@ -861,17 +930,50 @@ uint32 Unit::DealDamage(Unit* pVictim, uint32 damage, CleanDamage const* cleanDa
     else if (IsPlayer() && ToPlayer()->IsHardcore() && pVictim->IsCreature() && (pVictim->GetEntry() == 89 || GetEntry() == 14385))
         damage *= 10;
 
-    if (HasSpell(46023) || HasSpell(46024)) // Passive : AVOIDANCE for Pets.
-    {
-        if (spellProto && (spellProto->IsAreaOfEffectSpell() || spellProto->HasAreaAuraEffect()))
-            damage *= 0.5f;
-    }
-
     if (damage > 0 && sWorld.getConfig(CONFIG_BOOL_LEECH_ENABLE))
     {
         Unit* owner = GetOwner();
         bool isPetHit = owner && owner->GetTypeId() == TYPEID_PLAYER;
         Player* player = isPetHit ? owner->ToPlayer() : ToPlayer();
+
+        // Restrictions. Without them the leech applies to EVERY player -
+        // including the ~1000 random bots - and in PvP as well, where a flat
+        // heal on damage dealt skews fights. Each restriction can be switched
+        // off on its own; all default to on, so a bare "Leech.Enable = 1"
+        // holds no surprises.
+        if (player)
+        {
+            // Against non-players only (PvE)
+            if (sWorld.getConfig(CONFIG_BOOL_LEECH_PVE_ONLY) && pVictim->IsPlayer())
+                player = nullptr;
+
+            // Solo only (no party, no raid)
+            if (player && sWorld.getConfig(CONFIG_BOOL_LEECH_SOLO_ONLY) && player->GetGroup())
+                player = nullptr;
+
+            // Instances only - levelling out in the open world stays
+            // untouched, the bonus applies where soloing actually gets hard.
+            // Map::IsDungeon() covers dungeons and raids.
+            if (player && sWorld.getConfig(CONFIG_BOOL_LEECH_DUNGEON_ONLY) &&
+                !(player->GetMap() && player->GetMap()->IsDungeon()))
+                player = nullptr;
+
+            // Real players only - random bots run on RNDBOT accounts.
+            // Looked up by account id because bot sessions carry no
+            // account name of their own.
+            if (player && sWorld.getConfig(CONFIG_BOOL_LEECH_REAL_PLAYERS_ONLY))
+            {
+                std::string leechAccName;
+                if (WorldSession* leechSession = player->GetSession())
+                    sAccountMgr.GetName(leechSession->GetAccountId(), leechAccName);
+                for (char& c : leechAccName)
+                    if (c >= 'a' && c <= 'z')
+                        c = c - 'a' + 'A';
+                if (leechAccName.rfind("RNDBOT", 0) == 0)
+                    player = nullptr;
+            }
+        }
+
         if (player)
         {
             float leechAmount = sWorld.getConfig(CONFIG_FLOAT_LEECH_AMOUNT);
@@ -934,18 +1036,28 @@ uint32 Unit::DealDamage(Unit* pVictim, uint32 damage, CleanDamage const* cleanDa
                 pVictim->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_DIRECT_DAMAGE);
         }
 
-        if (!pVictim->IsPlayer() && addThreat)
+        // Split on what the victim is, and only then on whether threat applies.
+        // Written as "!IsPlayer() && addThreat", the else branch caught every
+        // creature hit without threat as well and handed it to the player-only
+        // code below, which casts pVictim to Player*. Crash of 2026-08-08: a
+        // periodic tick on a creature reached DurabilityPointLossForEquipSlot,
+        // and Object::GetUInt32Value threw on the resulting nonsense - the same
+        // pointer appeared as Player in one frame and Creature in another.
+        if (!pVictim->IsPlayer())
         {
-            float threat = damage * sSpellMgr.GetSpellThreatMultiplier(spellProto);
-
-            if (spell && !spell->m_addThreat)
+            if (addThreat)
             {
-                // empty on purpose.
+                float threat = damage * sSpellMgr.GetSpellThreatMultiplier(spellProto);
+
+                if (spell && !spell->m_addThreat)
+                {
+                    // empty on purpose.
+                }
+                else
+                    pVictim->AddThreat(this, threat, (cleanDamage && cleanDamage->hitOutCome == MELEE_HIT_CRIT), damageSchoolMask, spellProto);
             }
-            else
-                pVictim->AddThreat(this, threat, (cleanDamage && cleanDamage->hitOutCome == MELEE_HIT_CRIT), damageSchoolMask, spellProto);
         }
-        else                                                // victim is a player
+        else                                                // victim really is a player
         {
             // Rage from damage received
             if (this != pVictim && pVictim->GetPowerType() == POWER_RAGE)
@@ -1059,7 +1171,7 @@ uint32 Unit::DealDamage(Unit* pVictim, uint32 damage, CleanDamage const* cleanDa
             pVictim->RemoveAura(PLAINSRUNNING_FIRST_TICK, EFFECT_INDEX_0);
             pVictim->RemoveAura(PLAINSRUNNING_FIRST_TICK, EFFECT_INDEX_1);
         }
-        else if (pVictim->HasAura(PLAINSRUNNING_SPELL)) 
+        else if (pVictim->HasAura(PLAINSRUNNING_SPELL))
         {
             pVictim->RemoveAura(PLAINSRUNNING_SPELL, EFFECT_INDEX_0);
             pVictim->RemoveAura(PLAINSRUNNING_SPELL, EFFECT_INDEX_1);
@@ -1321,6 +1433,18 @@ void Unit::Kill(Unit* pVictim, SpellEntry const *spellProto, bool durabilityLoss
         pVictim->SetHealth(0);
         DEBUG_FILTER_LOG(LOG_FILTER_DAMAGE, "SET JUST_DIED");
         pVictim->SetDeathState(JUST_DIED);
+        ScriptRegistry<UnitScript>::ForEachEnabledHook(UNITHOOK_ON_UNIT_DEATH, [&](UnitScript* script)
+        {
+            script->OnUnitDeath(pVictim, this);
+        });
+
+        if (Player* playerVictim = pVictim->ToPlayer())
+        {
+            ScriptRegistry<PlayerScript>::ForEachEnabledHook(PLAYERHOOK_ON_PLAYER_JUST_DIED, [&](PlayerScript* script)
+            {
+                script->OnPlayerJustDied(playerVictim);
+            });
+        }
 
         if (pPlayerVictim && pVictim->GetUInt32Value(PLAYER_SELF_RES_SPELL))
             pVictim->DirectSendPublicValueUpdate(PLAYER_SELF_RES_SPELL);
@@ -2127,28 +2251,6 @@ void Unit::CalculateDamageAbsorbAndResist(WorldObject *pCaster, SpellSchoolMask 
         if (mod->m_amount <= 0)
             existExpired = true;
 
-        // CUSTOM priest talent Reflective Shields
-        if (aura->GetSpellProto()->IsFitToFamily<SPELLFAMILY_PRIEST, CF_PRIEST_POWER_WORD_SHIELD>())
-        {
-            if (const auto caster = aura->GetCaster(); caster && caster->HasAura(45560))
-            {
-                // 20% of currentAbsorb
-                int32_t const reflect_damage = currentAbsorb * 0.2f;
-                if (reflect_damage)
-                {
-                    m_Events.AddLambdaEventAtOffset([this, victimGuid = pCaster->GetObjectGuid(), reflect_damage]()
-                        {
-                            if (Map* map = FindMap())
-                            {
-                                if (Unit* victim = map->GetUnit(victimGuid))
-                                {
-                                    CastCustomSpell(victim, 45561, &reflect_damage, nullptr, nullptr, true);
-                                }
-                            }
-                        }, 1);
-                }
-            }
-        }
     }
 
     // Remove all expired absorb auras
@@ -3411,6 +3513,41 @@ int32 Unit::GetTotalAuraModifier(AuraType auratype) const
     return modifier;
 }
 
+int32 Unit::GetTotalAuraRangeModifier(AuraType auratype) const
+{
+    int32 modifier = 0;
+
+    AuraList const& mTotalAuraList = GetAurasByType(auratype);
+    for (const auto& i : mTotalAuraList)
+    {
+        SpellEntry const* spellProto = i->GetSpellProto();
+        if (GetTypeId() == TYPEID_PLAYER && spellProto->EquippedItemClass == ITEM_CLASS_WEAPON)
+        {
+            Player const* player = static_cast<Player const*>(this);
+            bool hasMatchingWeapon = false;
+            for (int attack = 0; attack < MAX_ATTACK; ++attack)
+            {
+                WeaponAttackType const attackType = WeaponAttackType(attack);
+                if (Item* item = player->GetWeaponForAttack(attackType, true, true))
+                {
+                    if (item->IsFitToSpellRequirements(spellProto))
+                    {
+                        hasMatchingWeapon = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!hasMatchingWeapon)
+                continue;
+        }
+
+        modifier += i->GetModifier()->m_amount;
+    }
+
+    return modifier;
+}
+
 float Unit::GetTotalAuraMultiplier(AuraType auratype) const
 {
     float multiplier = 1.0f;
@@ -3511,6 +3648,18 @@ float Unit::GetTotalAuraMultiplierByMiscValue(AuraType auratype, int32 misc_valu
 bool Unit::AddSpellAuraHolder(SpellAuraHolder *holder)
 {
     SpellEntry const* aurSpellInfo = holder->GetSpellProto();
+
+    // aura-attempt hook. Logged BEFORE any
+    // early-returns (refresh, stack, dead target, debuff-limit, etc.) so the bot
+    // log captures every aura that any code path tries to put on a bot — even
+    // those that get rejected or merged into an existing holder. This was needed
+    // to debug a self-applied Bash 25515 that was invisible to the post-success
+    // hook below (refreshes never reach it). Logged with tag AURA_ATTEMPT so it's
+    // distinguishable from the AURA_APPLY tag that fires on confirmed first-apply.
+    {
+        extern void BotActionLog_LogAuraAttempt(Unit* target, uint32 spellId, int32 durationMs, uint64 casterGuidRaw);
+        BotActionLog_LogAuraAttempt(this, holder->GetId(), holder->GetAuraMaxDuration(), holder->GetCasterGuid().GetRawValue());
+    }
 
     // ghost spell check, allow apply any auras at player loading in ghost mode (will be cleanup after load)
     if (!IsAlive() && !aurSpellInfo->IsDeathPersistentSpell() && !aurSpellInfo->CanTargetDeadTarget() &&
@@ -3729,6 +3878,15 @@ bool Unit::AddSpellAuraHolder(SpellAuraHolder *holder)
     }
     // When we call _AddSpellAuraHolder, we must have a free aura slot
     holder->_AddSpellAuraHolder();
+
+    // bot logging suite — hook aura applies. The
+    // wrapper checks if `this` is a bot Player; non-bots cost only the
+    // GetPlayerbotAI() null check. Resolves at final mangosd link.
+    {
+        extern void BotActionLog_LogAuraApply(Unit* target, uint32 spellId, int32 durationMs, uint64 casterGuidRaw);
+        int32 durMs = holder->GetAuraMaxDuration();
+        BotActionLog_LogAuraApply(this, holder->GetId(), durMs, holder->GetCasterGuid().GetRawValue());
+    }
 
     return true;
 }
@@ -4304,6 +4462,13 @@ void Unit::DeleteAuraHolder(SpellAuraHolder *holder)
 
 void Unit::RemoveSpellAuraHolder(SpellAuraHolder *holder, AuraRemoveMode mode)
 {
+    // bot logging suite — hook aura removes. Logged
+    // BEFORE the holder is destroyed so the caster GUID is still valid.
+    {
+        extern void BotActionLog_LogAuraRemove(Unit* target, uint32 spellId, uint64 casterGuidRaw);
+        BotActionLog_LogAuraRemove(this, holder->GetId(), holder->GetCasterGuid().GetRawValue());
+    }
+
     // Statue unsummoned at holder remove
     Totem* statue = nullptr;
     WorldObject* caster = holder->GetRealCaster();
@@ -4341,39 +4506,6 @@ void Unit::RemoveSpellAuraHolder(SpellAuraHolder *holder, AuraRemoveMode mode)
     if (!foundInMap)
         sLog.outInfo("[Crash/Auras] Removing aura holder *not* in holders map ! Aura %u on %s", holder->GetId(), GetName());
     holder->SetRemoveMode(mode);
-
-    // Resurgent Shield
-    if (mode == AURA_REMOVE_BY_SHIELD_BREAK &&
-        holder->GetSpellProto()->IsFitToFamily<SPELLFAMILY_PRIEST, CF_PRIEST_POWER_WORD_SHIELD>())
-    {
-        if (Unit* caster = holder->GetCaster())
-            if (caster->HasAura(45560))
-            {
-                // Determine initial absorb amount from the shield aura.
-                int32 totalAbsorb = 0;
-                for (int i = 0; i < MAX_EFFECT_INDEX; ++i)
-                {
-                    if (Aura* aura = holder->GetAuraByEffectIndex(SpellEffectIndex(i)))
-                    {
-                        if (aura->GetModifier()->m_auraname == SPELL_AURA_SCHOOL_ABSORB)
-                        {
-                            totalAbsorb = aura->GetInitialAbsorbAmount();
-                            break;
-                        }
-                    }
-                }
-
-                // Fallback if no snapshot was found.
-                if (totalAbsorb <= 0)
-                    totalAbsorb = 0;
-
-                int32 base1 = totalAbsorb / 10;
-                int32 base2 = totalAbsorb / 10;
-                int32 base3 = static_cast<int32>(holder->GetSpellProto()->manaCost);
-
-                caster->CastCustomSpell(caster, 51477, &base1, &base2, &base3, true);
-            }
-    }
 
     holder->UnregisterSingleCastHolder();
     holder->HandleCastOnAuraRemoval();
@@ -5743,6 +5875,9 @@ uint32 Unit::SpellDamageBonusTaken(WorldObject* pCaster, SpellEntry const* spell
     takenTotalMod *= GetTotalAuraMultiplierByMiscMask(SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN, schoolMask);
     if (spellProto->IsAreaOfEffectSpell())
         takenTotalMod *= GetTotalAuraMultiplier(SPELL_AURA_MOD_AOE_DAMAGE_PERCENT_TAKEN);
+    // Native chain avoidance is school-filtered and applies to the recipient.
+    if (spellProto->EffectChainTarget[effectIndex] > 1)
+        takenTotalMod *= GetTotalAuraMultiplierByMiscMask(SPELL_AURA_MOD_CHAIN_DAMAGE_PERCENT_TAKEN, schoolMask);
     if (damagetype == DOT)
         takenTotalMod *= GetTotalAuraMultiplier(SPELL_AURA_MOD_PERIODIC_DAMAGE_PERCENT_TAKEN);
 
@@ -5756,7 +5891,16 @@ uint32 Unit::SpellDamageBonusTaken(WorldObject* pCaster, SpellEntry const* spell
         takenFlatMod = -float(pdamage / 2);
     // use float as more appropriate for negative values and percent applying
     float tmpDamage = (pdamage + takenFlatMod) * takenTotalMod;
-    return tmpDamage > 0 ? uint32(roundf(tmpDamage)) : 0;
+    int32 damage = tmpDamage > 0 ? int32(roundf(tmpDamage)) : 0;
+    if (Unit* attacker = pCaster->ToUnit())
+    {
+        ScriptRegistry<UnitScript>::ForEachEnabledHook(UNITHOOK_MODIFY_SPELL_DAMAGE_TAKEN, [&](UnitScript* script)
+        {
+            script->ModifySpellDamageTaken(const_cast<Unit*>(this), attacker, damage, spellProto);
+        });
+    }
+
+    return damage > 0 ? uint32(damage) : 0;
 }
 
 int32 Unit::SpellBaseDamageBonusTaken(SpellSchoolMask schoolMask) const
@@ -5865,19 +6009,12 @@ bool Unit::IsSpellCrit(Unit const* pVictim, SpellEntry const* spellProto, SpellS
                     {
                         // Shatter
                         case 849:
-                            if (pVictim->IsFrozen()) crit_chance += 10.0f;
-                            break;
                         case 910:
-                            if (pVictim->IsFrozen()) crit_chance += 20.0f;
-                            break;
                         case 911:
-                            if (pVictim->IsFrozen()) crit_chance += 30.0f;
-                            break;
                         case 912:
-                            if (pVictim->IsFrozen()) crit_chance += 40.0f;
-                            break;
                         case 913:
-                            if (pVictim->IsFrozen()) crit_chance += 50.0f;
+                            if (pVictim->IsFrozen())
+                                crit_chance += i->GetModifier()->m_amount;
                             break;
                         default:
                             break;
@@ -5976,7 +6113,16 @@ uint32 Unit::SpellHealingBonusTaken(WorldObject* pCaster, SpellEntry const* spel
 
     // use float as more appropriate for negative values and percent applying
     float heal = (healamount + takenFlatMod) * takenTotalMod;
-    return heal < 0 ? 0 : uint32(roundf(heal));
+    uint32 finalHeal = heal < 0 ? 0 : uint32(roundf(heal));
+    if (Unit* healer = pCaster ? pCaster->ToUnit() : nullptr)
+    {
+        ScriptRegistry<UnitScript>::ForEachEnabledHook(UNITHOOK_MODIFY_HEAL_RECEIVED, [&](UnitScript* script)
+        {
+            script->ModifyHealReceived(const_cast<Unit*>(this), healer, finalHeal, spellProto);
+        });
+    }
+
+    return finalHeal;
 }
 
 int32 Unit::SpellBaseHealingBonusTaken(SpellSchoolMask schoolMask) const
@@ -6292,6 +6438,9 @@ uint32 Unit::MeleeDamageBonusTaken(WorldObject* pCaster, uint32 pdamage, WeaponA
     TakenPercent *= GetTotalAuraMultiplierByMiscMask(SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN, schoolMask);
     if (spellProto && spellProto->IsAreaOfEffectSpell())
         TakenPercent *= GetTotalAuraMultiplier(SPELL_AURA_MOD_AOE_DAMAGE_PERCENT_TAKEN);
+    // Weapon-based chain spells use the same recipient-side aura contract.
+    if (spellProto && spellProto->EffectChainTarget[effectIndex] > 1)
+        TakenPercent *= GetTotalAuraMultiplierByMiscMask(SPELL_AURA_MOD_CHAIN_DAMAGE_PERCENT_TAKEN, schoolMask);
     if (spellProto && damagetype == DOT)
         TakenPercent *= GetTotalAuraMultiplier(SPELL_AURA_MOD_PERIODIC_DAMAGE_PERCENT_TAKEN);
 
@@ -6317,7 +6466,16 @@ uint32 Unit::MeleeDamageBonusTaken(WorldObject* pCaster, uint32 pdamage, WeaponA
     float tmpDamage = float(int32(pdamage) + TakenFlat * int32(stack)) * TakenPercent;
 
     // bonus result can be negative
-    return tmpDamage > 0 ? uint32(tmpDamage) : 0;
+    uint32 damage = tmpDamage > 0 ? uint32(tmpDamage) : 0;
+    if (Unit* attacker = pCaster->ToUnit())
+    {
+        ScriptRegistry<UnitScript>::ForEachEnabledHook(UNITHOOK_MODIFY_MELEE_DAMAGE, [&](UnitScript* script)
+        {
+            script->ModifyMeleeDamage(this, attacker, damage);
+        });
+    }
+
+    return damage;
 }
 
 void Unit::ApplySpellImmune(uint32 spellId, uint32 op, uint32 type, bool apply)
@@ -6561,6 +6719,14 @@ void Unit::SetInCombatState(uint32 combatTimer, Unit* pEnemy)
 
     SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IN_COMBAT);
 
+    if (!wasInCombat)
+    {
+        ScriptRegistry<UnitScript>::ForEachEnabledHook(UNITHOOK_ON_UNIT_ENTER_COMBAT, [&](UnitScript* script)
+        {
+            script->OnUnitEnterCombat(this, pEnemy);
+        });
+    }
+
     if (IsCharmed() || (IsCreature() && ((Creature*)this)->IsPet()))
         SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PET_IN_COMBAT);
 
@@ -6729,6 +6895,8 @@ void Unit::SetInCombatWithVictim(Unit* pVictim, bool touchOnly/* = false*/, uint
 
 void Unit::ClearInCombat()
 {
+    bool wasInCombat = IsInCombat();
+
     m_combatTimer = 0;
     RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IN_COMBAT);
     RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PET_IN_COMBAT);
@@ -6737,6 +6905,14 @@ void Unit::ClearInCombat()
     {
         static_cast<Player*>(this)->pvpInfo.inPvPCombat = false;
         static_cast<Player*>(this)->ClearTemporaryWarWithFactions();
+    }
+
+    if (wasInCombat)
+    {
+        ScriptRegistry<UnitScript>::ForEachEnabledHook(UNITHOOK_ON_UNIT_EXIT_COMBAT, [&](UnitScript* script)
+        {
+            script->OnUnitExitCombat(this);
+        });
     }
 }
 
@@ -6814,6 +6990,18 @@ int32 Unit::ModifyPower(Powers power, int32 dVal)
 {
     if (dVal == 0)
         return 0;
+
+    if (power == POWER_MANA && dVal > 0)
+    {
+        int32 const manaGainMod = GetTotalAuraModifier(SPELL_AURA_MOD_MANA_GAIN_PERCENT);
+        if (manaGainMod)
+        {
+            float const multiplier = std::max(0.0f, (100.0f + manaGainMod) / 100.0f);
+            dVal = int32(float(dVal) * multiplier);
+            if (dVal <= 0)
+                return 0;
+        }
+    }
 
     int32 gain = 0;
     int32 curPower = (int32)GetPower(power);
@@ -7611,8 +7799,24 @@ void Unit::UpdateSpeed(UnitMoveType mtype, bool forced, float ratio)
     int32 slow = GetMaxNegativeAuraModifier(SPELL_AURA_MOD_DECREASE_SPEED);
 	if (slow)
 	{
-		int32 scaledSlow = int32(float(slow) * ratio);
-        speed *= (100.0f + scaledSlow) / 100.0f;
+        // NOT scaled by ratio. ratio is the caller's speed MULTIPLIER - the
+        // playerbots pass 10 so their bots travel faster - and it is applied to
+        // the finished rate further down. Feeding it into the SLOW as well turns
+        // any snare of 10% or more into -100% or worse, and the resulting zero or
+        // negative rate makes MoveSplineInitArgs::Validate reject every spline:
+        // the unit then stands still forever holding a perfectly good path, and
+        // nothing above ever learns that it did not move. Blackfathom Deeps,
+        // 2026-08-29: 122 rejected splines per 20 minutes across 19 bots, ten
+        // times the rate of the dry dungeon that cleared fine. The sibling line
+        // above (main_speed_mod *= ratio) is commented out for the same reason.
+        //
+        // No-op for everyone else: ratio defaults to 1.0 and slow * 1 == slow.
+        speed *= (100.0f + slow) / 100.0f;
+        // A full snare is a HOLD, not a reversal. Never let the rate reach zero
+        // here, or the spline is rejected outright instead of the unit simply
+        // being slowed to a crawl - rejection is what strands it.
+        if (speed < 0.01f)
+            speed = 0.01f;
 	}
 
     if (IsCreature())
@@ -9379,6 +9583,9 @@ uint32 CreateProcExtendMask(SpellNonMeleeDamage* damageInfo, SpellMissInfo missC
                 // On absorb
                 if (damageInfo->absorb)
                     procEx |= PROC_EX_ABSORB;
+                // On partial resist
+                if (damageInfo->resist > 0 && damageInfo->damage > 0)
+                    procEx |= PROC_EX_PARTIAL_RESIST;
                 // On crit
                 if (damageInfo->HitInfo & SPELL_HIT_TYPE_CRIT)
                     procEx |= PROC_EX_CRITICAL_HIT;
@@ -10309,18 +10516,134 @@ void Unit::UpdateAuraForGroup(uint8 slot)
     }
 }
 
+bool Unit::IsWarlockEnslavedDemon(Unit const* demon) const
+{
+    if (!IsPlayer() || GetClass() != CLASS_WARLOCK || !demon || GetCharm() != demon)
+        return false;
+
+    Creature const* creature = demon->ToCreature();
+    CreatureInfo const* creatureInfo = creature ? creature->GetCreatureInfo() : nullptr;
+    return creature && creature->IsAlive() && creatureInfo && creatureInfo->type == CREATURE_TYPE_DEMON;
+}
+
+void Unit::CastPetAuraOnUnit(PetAura const* petAura, Unit* target) const
+{
+    uint32 auraId = petAura->GetAura(target->GetEntry());
+    if (!auraId)
+        return;
+
+    if (auraId == 35696)                                      // Demonic Knowledge
+    {
+        int32 basePoints = int32(petAura->GetDamage() * (target->GetStat(STAT_STAMINA) + target->GetStat(STAT_INTELLECT)) / 100);
+        target->CastCustomSpell(target, auraId, &basePoints, nullptr, nullptr, true);
+    }
+    else
+        target->CastSpell(target, auraId, true);
+}
+
+void Unit::UpdateEnslavedDemonPetStats()
+{
+    Unit* demon = GetCharm();
+    if (!IsWarlockEnslavedDemon(demon))
+        return;
+
+    Player* player = ToPlayer();
+    if (!player)
+        return;
+
+    for (Stats stat : { STAT_STAMINA, STAT_INTELLECT })
+    {
+        float bonusValue = 0.0f;
+        float value = demon->GetTotalStatValue(stat);
+
+        AuraList const& demonPetStatAuras = demon->GetAurasByType(SPELL_AURA_MOD_PET_STAT_PERCENT_OF_OWNER);
+        for (Aura const* aura : demonPetStatAuras)
+            if (aura->GetModifier()->m_miscvalue == int32(stat))
+                bonusValue += player->GetStat(stat) * aura->GetModifier()->m_amount / 100.0f;
+
+        AuraList const& ownerPetStatAuras = player->GetAurasByType(SPELL_AURA_MOD_PET_STAT_PERCENT_OF_OWNER);
+        for (Aura const* aura : ownerPetStatAuras)
+            if (aura->GetModifier()->m_miscvalue == int32(stat))
+                bonusValue += player->GetStat(stat) * aura->GetModifier()->m_amount / 100.0f;
+
+        value += bonusValue;
+
+        demon->SetStat(stat, int32(value));
+
+        switch (stat)
+        {
+            case STAT_STAMINA:
+            {
+                UnitMods unitMod = UNIT_MOD_HEALTH;
+                float health = demon->GetTotalAuraModValue(unitMod) + bonusValue * 10.0f;
+                demon->SetMaxHealth(std::max(1, int(health)));
+                break;
+            }
+            case STAT_INTELLECT:
+            {
+                UnitMods unitMod = UnitMods(UNIT_MOD_POWER_START + POWER_MANA);
+                float mana = demon->GetTotalAuraModValue(unitMod) + bonusValue * 15.0f;
+                demon->SetMaxPower(POWER_MANA, uint32(mana));
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    if (demon->GetMaxPower(POWER_MANA))
+        demon->UpdateManaRegen();
+}
+
 void Unit::AddPetAura(PetAura const* petSpell)
 {
     m_petAuras.insert(petSpell);
     if (Pet* pet = GetPet())
         pet->CastPetAura(petSpell);
+
+    Unit* demon = GetCharm();
+    if (IsWarlockEnslavedDemon(demon))
+        CastPetAuraOnUnit(petSpell, demon);
 }
 
 void Unit::RemovePetAura(PetAura const* petSpell)
 {
-    m_petAuras.erase(petSpell);
     if (Pet* pet = GetPet())
         pet->RemoveAurasDueToSpell(petSpell->GetAura(pet->GetEntry()));
+
+    Unit* demon = GetCharm();
+    if (IsWarlockEnslavedDemon(demon))
+        if (uint32 auraId = petSpell->GetAura(demon->GetEntry()))
+            demon->RemoveAurasDueToSpell(auraId);
+
+    m_petAuras.erase(petSpell);
+}
+
+void Unit::CastEnslavedDemonPetAuras()
+{
+    Unit* demon = GetCharm();
+    if (!IsWarlockEnslavedDemon(demon))
+        return;
+
+    for (PetAura const* petAura : m_petAuras)
+    {
+        uint32 auraId = petAura->GetAura(demon->GetEntry());
+        if (!auraId)
+            continue;
+
+        CastPetAuraOnUnit(petAura, demon);
+    }
+}
+
+void Unit::RemoveEnslavedDemonPetAuras()
+{
+    Unit* demon = GetCharm();
+    if (!IsWarlockEnslavedDemon(demon))
+        return;
+
+    for (PetAura const* petAura : m_petAuras)
+        if (uint32 auraId = petAura->GetAura(demon->GetEntry()))
+            demon->RemoveAurasDueToSpell(auraId);
 }
 
 void Unit::RemoveAurasAtMechanicImmunity(uint32 mechMask, uint32 exceptSpellId, bool non_positive /*= false*/)
@@ -10925,6 +11248,7 @@ float Unit::GetCombatReach(Unit const* pVictim, bool ability, float flat_mod) co
         : 0.0f;
 
     float reach = GetCombatReach(true) + victimReach + flat_mod;
+    reach += GetTotalAuraRangeModifier(SPELL_AURA_MOD_ATTACK_AND_SPELL_RANGE) / 1000.0f;
 
     reach += BASE_MELEERANGE_OFFSET;
     if (reach < ATTACK_DISTANCE)
@@ -11578,6 +11902,86 @@ void Unit::RestoreMovement()
     }
 }
 
+// bot passes SpellEntry; forward to spell_id version.
+void Unit::RemoveSpellCooldown(SpellEntry const& spellInfo, bool update)
+{
+    RemoveSpellCooldown(spellInfo.Id, update);
+}
+
+bool Unit::IsSpellReady(SpellEntry const* spellInfo) const
+{
+    return spellInfo && IsSpellReady(spellInfo->Id);
+}
+
+void Unit::RemoveSpellCooldown(SpellEntry const* spellInfo, bool update)
+{
+    if (spellInfo)
+        RemoveSpellCooldown(spellInfo->Id, update);
+}
+
+void Unit::RemoveSpellCategoryCooldown(uint32 category, bool update)
+{
+    for (auto itr = m_spellCooldowns.begin(); itr != m_spellCooldowns.end();)
+    {
+        if (itr->second.cat != category)
+        {
+            ++itr;
+            continue;
+        }
+
+        uint32 spellId = itr->first;
+        itr = m_spellCooldowns.erase(itr);
+        if (update)
+            if (Player* player = GetAffectingPlayer())
+                player->SendClearCooldown(spellId, this);
+    }
+}
+
+bool Unit::IsTotalImmune() const
+{
+    uint32 immuneMask = 0;
+    for (Aura const* aura : GetAurasByType(SPELL_AURA_SCHOOL_IMMUNITY))
+        immuneMask |= aura->GetModifier()->m_miscvalue;
+
+    return immuneMask == SPELL_SCHOOL_MASK_ALL;
+}
+
+struct IsAttackingPlayerHelper
+{
+    bool operator()(Unit const* unit) const { return unit->isAttackingPlayer(); }
+};
+
+bool Unit::isAttackingPlayer() const
+{
+    if (GetTargetGuid().IsPlayer())
+        return true;
+
+    return CheckAllControlledUnits(IsAttackingPlayerHelper(), CONTROLLED_PET | CONTROLLED_TOTEMS | CONTROLLED_GUARDIANS | CONTROLLED_CHARM);
+}
+
+bool Unit::IsTargetableBy(WorldObject const* caster, bool forAoE, bool checkAlive, bool helpful) const
+{
+    Unit const* casterUnit = caster ? caster->ToUnit() : nullptr;
+    bool const attackerIsPlayer = casterUnit && casterUnit->IsCharmerOrOwnerPlayerOrPlayerItself();
+    return IsTargetable(!helpful, attackerIsPlayer, forAoE, checkAlive);
+}
+
+// bot calls unit->GetAttackDistance(target) on a Unit*.
+// Penqle implements this only on Creature. Forward when we are a Creature, else return a default.
+float Unit::GetAttackDistance(Unit const* target) const
+{
+    if (GetTypeId() == TYPEID_UNIT)
+        return ((Creature const*)this)->GetAttackDistance(target);
+    return 20.0f; // reasonable default for non-creature attackers
+}
+
+// GetCreator returns the unit that summoned this one.
+Unit* Unit::GetCreator() const
+{
+    ObjectGuid const& guid = GetCreatorGuid();
+    return guid.IsEmpty() ? nullptr : ObjectAccessor::GetUnit(*this, guid);
+}
+
 /** Spell cooldown management system. Shared by Players, Creatures, Pets, ... */
 void Unit::RemoveSpellCooldown(uint32 spell_id, bool update)
 {
@@ -11836,3 +12240,6 @@ float Unit::GetScaleForDisplayId(uint32 displayId)
 
     return DEFAULT_OBJECT_SCALE;
 }
+
+// See the declaration: AzerothCore spelling of IsDead.
+bool Unit::isDead() const { return IsDead(); }

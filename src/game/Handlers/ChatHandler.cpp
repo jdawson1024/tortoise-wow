@@ -34,6 +34,7 @@
 #include "Guild.h"
 #include "GuildMgr.h"
 #include "Player.h"
+#include "ScriptObjects.h"
 #include "SpellAuras.h"
 #include "Language.h"
 #include "Util.h"
@@ -43,7 +44,9 @@
 #include "Anticheat.h"
 #include "AccountMgr.h"
 #include "Config/Config.h"
+#include "CustomMerchantMgr.h"
 #include "Database/DatabaseImpl.h"
+#include "HonorMgr.h"
 #include "Shop/ShopMgr.h"
 #include "GMTicketMgr.h"
 
@@ -77,10 +80,15 @@ bool WorldSession::CheckChatMessageValidity(std::string& msg, uint32 lang, uint3
     return true;
 }
 
-bool WorldSession::ProcessChatMessageAfterSecurityCheck(std::string& msg, uint32 lang, uint32 msgType)
+bool WorldSession::ProcessChatMessageAfterSecurityCheck(std::string& msg, uint32& lang, uint32& msgType)
 {
     if (!CheckChatMessageValidity(msg, lang, msgType))
         return false;
+
+    ScriptRegistry<PlayerScript>::ForEachEnabledHook(PLAYERHOOK_ON_BEFORE_SEND_CHAT_MESSAGE, [&](PlayerScript* script)
+    {
+        script->OnBeforeSendChatMessage(GetPlayer(), msgType, lang, msg);
+    });
 
     ChatHandler handler(this);
 
@@ -390,6 +398,26 @@ void WorldSession::HandleMessagechatOpcode(WorldPacket & recv_data)
             if (hasChinese(w_normMsg))
                 return;
         }
+    }
+
+    // Dispatch chat to the master's own bots so they can react to /party,
+    // /raid, /guild, /say, /yell, and whispers. cmangos hooks here (in
+    // HandleMessagechatOpcode, after validation and before broadcast).
+    // A module driving puppets for this player parses it as a command there.
+    if (_player)
+    {
+        ScriptRegistry<PlayerScript>::ForEachEnabledHook(PLAYERHOOK_ON_CHAT_COMMAND, [&](PlayerScript* script)
+        {
+            script->OnChatCommand(_player, type, msg, lang, to);
+        });
+
+        // A module may claim the line for itself - see CanUseGroupChat.
+        bool const suppressed = ScriptRegistry<PlayerScript>::ForEachEnabledHookWithReturn(PLAYERHOOK_CAN_USE_GROUP_CHAT, [&](PlayerScript* script)
+        {
+            return !script->CanUseGroupChat(_player, type, lang, msg);
+        });
+        if (suppressed)
+            return;
     }
 
     // Message handling
@@ -855,6 +883,11 @@ void WorldSession::HandleEmoteOpcode(WorldPacket & recv_data)
     if (emote != EMOTE_ONESHOT_NONE && emote != EMOTE_ONESHOT_WAVE)
         return;
 
+    ScriptRegistry<PlayerScript>::ForEachEnabledHook(PLAYERHOOK_ON_EMOTE, [&](PlayerScript* script)
+    {
+        script->OnEmote(GetPlayer(), emote);
+    });
+
     GetPlayer()->HandleEmoteCommand(emote);
 }
 
@@ -914,6 +947,11 @@ void WorldSession::HandleTextEmoteOpcode(WorldPacket & recv_data)
     recv_data >> textEmote;
     recv_data >> emoteNum;
     recv_data >> guid;
+
+    ScriptRegistry<PlayerScript>::ForEachEnabledHook(PLAYERHOOK_ON_TEXT_EMOTE, [&](PlayerScript* script)
+    {
+        script->OnTextEmote(GetPlayer(), textEmote, emoteNum, guid);
+    });
 
     EmotesTextEntry const* em = sEmotesTextStore.LookupEntry(textEmote);
     if (!em)
@@ -1003,6 +1041,15 @@ bool WorldSession::HandleTurtleAddonMessages(uint32 lang, uint32 type, std::stri
 
     if (sLFTMgr.HandleAddonMessage(_player, type, msg))
         return true;
+
+    if (sCustomMerchantMgr.HandleAddonMessage(this, _player, type, msg))
+        return true;
+
+    if (type == CHAT_MSG_GUILD && msg == "TW_HONOR\tC2S_HONOR_REQUEST")
+    {
+        _player->GetHonorMgr().SendHonorCurrencyUpdate();
+        return true;
+    }
 
     //guild bank
     // no type == CHAT_MSG_GUILD on this, to protecc fraudulent messages
@@ -1185,13 +1232,30 @@ bool WorldSession::HandleTurtleAddonMessages(uint32 lang, uint32 type, std::stri
 
             if (strstr(msg.c_str(), "Categories"))
             {
+                // Format per category is `id=parentId=name=icon;` - FOUR fields.
+                // The client (Turtle_ShopUI.lua's Shop_ProcessCategories, in
+                // patch-7.mpq) reads catEx[2] as the SUBCATEGORY PARENT id via
+                // tonumber() and then immediately does `if parentID > 0`. We
+                // used to send only three fields (`id=name=icon;`), so catEx[2]
+                // was the category NAME, tonumber() returned nil, and comparing
+                // nil > 0 threw a Lua error that aborted the whole parse loop.
+                // Symptom (confirmed live 2026-07-28): the shop window showed
+                // ONLY the "About" tab and no categories at all - About renders
+                // because the client injects it itself as a synthetic
+                // `0=0=About=about;` entry (four fields, parses fine) before
+                // the server's first real category kills the loop.
+                // This server has no subcategories (shop_categories has no
+                // parent column), so parentId is always 0 = top-level.
+                // The sibling "Entries:" reply below was already fixed for this
+                // client's 13-field format (see ObjectMgr::LoadShop) - only the
+                // category line was missed at the time.
                 std::string categories = "Categories:";
 
                 for (auto& itr : sObjectMgr.GetShopCategoriesList())
                     if (sWorld.getConfig(CONFIG_BOOL_SEA_NETWORK))
-                        categories += std::to_string(itr.first) + "=0=" + itr.second.Name_loc4 + "=" + itr.second.Icon + ";"; // TODO: parent_id
+                        categories += std::to_string(itr.first) + "=0=" + itr.second.Name_loc4 + "=" + itr.second.Icon + ";";
                     else
-                        categories += std::to_string(itr.first) + "=0=" + itr.second.Name + "=" + itr.second.Icon + ";"; // TODO: parent_id
+                        categories += std::to_string(itr.first) + "=0=" + itr.second.Name + "=" + itr.second.Icon + ";";
 
                 _player->SendAddonMessage(prefix, categories);
                 return true;

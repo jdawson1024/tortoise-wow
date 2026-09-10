@@ -24,6 +24,7 @@
 */
 
 #include "WorldSocket.h"                                    // must be first to make ACE happy with ACE includes in it
+#include "ArchitectureDiagnostics.h"
 #include "Common.h"
 #include "Database/DatabaseEnv.h"
 #include "Log.h"
@@ -41,8 +42,9 @@
 #include "BattleGroundMgr.h"
 #include "MapManager.h"
 #include "SocialMgr.h"
+#include "ScriptObjects.h"
 
-#include "PlayerBotMgr.h"
+// PlayerBotMgr.h include removed — Penqle stub binned for cmangos port.
 #include "Anticheat/Anticheat.h"
 #include "Anticheat/Movement/Movement.hpp"
 #include "Language.h"
@@ -87,7 +89,7 @@ WorldSession::WorldSession(uint32 id, WorldSocket *sock, AccountTypes sec, time_
     _accountFlags(0), m_idleTime(WorldTimer::getMSTime()), _player(nullptr), m_Socket(sock), _security(sec), _accountId(id), _logoutTime(0), m_inQueue(false),
     m_playerLoading(false), m_playerLogout(false), m_playerRecentlyLogout(false), m_playerSave(false), m_sessionDbcLocale(sWorld.GetAvailableDbcLocale(locale)),
     m_sessionDbLocaleIndex(sObjectMgr.GetIndexForLocale(locale)), m_latency(0), m_tutorialState(TUTORIALDATA_UNCHANGED), m_cheatData(nullptr),
-    m_bot(nullptr), m_lastReceivedPacketTime(0), m_clientOS(CLIENT_OS_UNKNOWN), m_clientPlatform(CLIENT_PLATFORM_UNKNOWN), _gameBuild(0),
+    m_lastReceivedPacketTime(0), m_clientOS(CLIENT_OS_UNKNOWN), m_clientPlatform(CLIENT_PLATFORM_UNKNOWN), _gameBuild(0),
     _charactersCount(10), _characterMaxLevel(sAccountMgr.GetHighestCharLevel(id)), _clientHashComputeStep(HASH_NOT_COMPUTED),
     m_lastPubChannelMsgTime(0), m_moveRejectTime(0), m_masterPlayer(nullptr), m_BinaryAddress(binaryIp),
     _whisper_targets(id, sWorld.getConfig(CONFIG_UINT32_WHISPER_TARGETS_MAX), sWorld.getConfig(CONFIG_UINT32_WHISPER_TARGETS_BYPASS_LEVEL),
@@ -100,6 +102,14 @@ WorldSession::WorldSession(uint32 id, WorldSocket *sock, AccountTypes sec, time_
     }
     else
         m_Address = "<BOT>";
+
+    // Start every session with the null implementation so that m_antiCheat is
+    // never a null pointer. InitAntiCheatSession swaps in the real one during
+    // a network login; bot sessions never pass through WorldSocket and so had
+    // nothing at all. Several handlers dereference it without checking -
+    // HandleMoveKnockBackAck among them, which the playerbot module calls
+    // directly, so a knocked-back bot would take the server down.
+    m_antiCheat = std::make_unique<NullSessionAnticheat>(this);
 
     m_lastUpdateTime = WorldTimer::getMSTime();
     _analyser = std::make_unique<AccountAnalyser>(this);
@@ -167,6 +177,14 @@ char const* WorldSession::GetPlayerName() const
 /// Send a packet to the client
 void WorldSession::SendPacket(WorldPacket const* packet)
 {
+    bool handledByScript = ScriptRegistry<ServerScript>::ForEachEnabledHookWithReturn(SERVERHOOK_CAN_PACKET_SEND, [&](ServerScript* script)
+    {
+        return !script->CanPacketSend(this, *packet);
+    });
+
+    if (handledByScript)
+        return;
+
     // There is a maximum size packet.
     if (packet->size() > 0x8000)
     {
@@ -216,6 +234,12 @@ void WorldSession::SendPacket(WorldPacket const* packet)
     }
 #endif
 
+    // outgoing-packet interceptor for bots.
+    // cmangos's WorldSession::SendPacket calls the bot AI's HandleBotOutgoingPacket here so
+    // the AI can react to server-originated events: group invites (auto-accept), vendor errors,
+    // BG queue status, resurrect requests, etc. Real-player sessions have m_playerbotAI=null
+    // so this is a no-op for them; bot sessions have null m_Socket AND m_playerbotAI set, so
+
 	if (m_Socket == nullptr)
         return;
 
@@ -260,6 +284,18 @@ uint32 GetChatPacketProcessingType(ChatPacketHeader* header)
     }
 
     return PACKET_PROCESS_WORLD;
+}
+
+/// Bot-side convenience overload: copy a (potentially stack-allocated) inline
+/// WorldPacket onto the heap so QueuePacket(WorldPacket*) can take ownership.
+void WorldSession::QueuePacket(WorldPacket const& new_packet)
+{
+    QueuePacket(new WorldPacket(new_packet));
+}
+
+void WorldSession::QueuePacket(std::unique_ptr<WorldPacket> new_packet)
+{
+    QueuePacket(new_packet.release());
 }
 
 /// Add an incoming packet to the queue
@@ -310,7 +346,11 @@ void WorldSession::LogUnprocessedTail(WorldPacket *packet)
 
 bool WorldSession::ForcePlayerLogoutDelay()
 {
-    if (!sWorld.IsStopped() && GetPlayer() && GetPlayer()->FindMap() && GetPlayer()->IsInWorld() && sPlayerBotMgr.ForceLogoutDelay())
+    // The bot-system gate (sPlayerBotMgr.ForceLogoutDelay()) was removed with the
+    // Penqle stub. The hardcore-protection delay logic below is non-bot-specific
+    // (it handles network-blip resilience) so we keep it active for any in-world
+    // player.
+    if (!sWorld.IsStopped() && GetPlayer() && GetPlayer()->FindMap() && GetPlayer()->IsInWorld())
     {
         sLog.out(LOG_CHAR, "[%s:%u@%s] Lost socket for character:[%s] (guid: %u)", GetUsername().c_str(), GetAccountId(), GetRemoteAddress().c_str(), _player->GetName() , _player->GetGUIDLow());
 
@@ -365,12 +405,8 @@ bool WorldSession::Update(PacketFilter& updater)
     //logout procedure should happen only in World::UpdateSessions() method!!!
     if (updater.ProcessLogout())
     {
-        if (m_bot != nullptr && m_bot->state == PB_STATE_OFFLINE)
-        {
-            LogoutPlayer(true);
-            return false;
-        }
-
+        // Penqle stub's m_bot/PB_STATE_OFFLINE early-logout removed. cmangos
+        // adds its own logout handling for offline bots 
         if (_clientHashComputeStep == HASH_COMPUTED && GetPlayer())
             _clientHashComputeStep = HASH_NOTIFIED;
 
@@ -391,13 +427,12 @@ bool WorldSession::Update(PacketFilter& updater)
 
         ///- If necessary, log the player out
         time_t currTime = time(nullptr);
-        bool forceConnection = sPlayerBotMgr.ForceAccountConnection(this);
-        if (sWorld.IsStopped())
-            forceConnection = false;
-        if ((!m_Socket || (ShouldLogOut(currTime) && !m_playerLoading)) && !forceConnection && m_bot == nullptr)
+        // Bot-driven forceConnection / m_bot guards removed (Penqle stub binned).
+        // cmangos's bot session handling re-introduces equivalent guards.
+        if ((!m_Socket || (ShouldLogOut(currTime) && !m_playerLoading)))
             LogoutPlayer(true);
 
-        if (!m_Socket && !forceConnection && this->m_bot == nullptr)
+        if (!m_Socket)
             return false;                                       //Will remove this session from the world session map
     }
     else // Async map based update
@@ -415,10 +450,34 @@ bool WorldSession::Update(PacketFilter& updater)
 
 bool WorldSession::CanProcessPackets() const
 {
-    return ((m_Socket && !m_Socket->IsClosed()) || (_player && sPlayerBotMgr.IsChatBot(_player->GetGUIDLow())));
+    // sPlayerBotMgr.IsChatBot() clause removed — Penqle stub binned. cmangos's
+    // bot system uses isRealPlayer() guards in instead.
+    return (m_Socket && !m_Socket->IsClosed());
 }
 
-void WorldSession::ProcessPackets(PacketFilter& updater)
+void WorldSession::HandleBotPackets()
+{
+    // Match ManTech's real queue handling, while retaining Turtle's opcode
+    // validation, script hooks and delayed-teleport boundary. Never run this
+    // from a map job: some queued bot actions change groups/guilds/other maps.
+    if (m_Socket || !_player || !_player->IsInWorld() || PlayerLoading())
+        return;
+    PacketFilter filter(this);
+    for (uint32 type = 0; type < PACKET_PROCESS_MAX_TYPE; ++type)
+    {
+        if (_recvQueue[type].empty())
+        {
+            _receivedPacketType[type] = false;
+            continue;
+        }
+        filter.SetProcessType(static_cast<PacketProcessing>(type));
+        ProcessPackets(filter, true);
+        if (!_player || !_player->IsInWorld())
+            break;
+    }
+}
+
+void WorldSession::ProcessPackets(PacketFilter& updater, bool botPackets, uint32 budgetMs)
 {
     WorldPacket* packet = nullptr;
     _receivedPacketType[updater.PacketProcessType()] = false;
@@ -427,17 +486,25 @@ void WorldSession::ProcessPackets(PacketFilter& updater)
 
     std::vector<WorldPacket*> requeuePackets;
 
-    constexpr uint32 MaxPacketsPerUpdate = 200;
+    if (botPackets) budgetMs = 2;
+    uint32 const MaxPacketsPerUpdate = botPackets || budgetMs ? 32 : 200;
     uint32 totalPackets = 0;
+    uint32 const start = WorldTimer::getMSTime();
 
-    while (CanProcessPackets() && _recvQueue[updater.PacketProcessType()].next(packet, updater))
+    while ((botPackets ? !m_Socket && _player && _player->IsInWorld() : CanProcessPackets()) &&
+        totalPackets < MaxPacketsPerUpdate &&
+        (!budgetMs || !totalPackets || WorldTimer::getMSTimeDiffToNow(start) < budgetMs) &&
+        _recvQueue[updater.PacketProcessType()].next(packet, updater))
     {
         ++totalPackets;
 
         _receivedPacketType[updater.PacketProcessType()] = true;
-        auto packetAllowed = AllowPacket(packet->GetOpcode(), timeNow);
+        auto packetAllowed = botPackets ? PacketAllowResult::Allowed : AllowPacket(packet->GetOpcode(), timeNow);
         if (packetAllowed == PacketAllowResult::Denied)
+        {
+            delete packet;
             break;
+        }
 
         if (packetAllowed == PacketAllowResult::Requeue)
         {
@@ -445,12 +512,24 @@ void WorldSession::ProcessPackets(PacketFilter& updater)
             continue;
         }
 
-
-        ALL_SESSION_SCRIPTS(this, OnPacket(packet->GetOpcode()));
         OpcodeHandler const& opHandle = opcodeTable[packet->GetOpcode()];
         try
         {
+            ALL_SESSION_SCRIPTS(this, OnPacket(packet->GetOpcode()));
+            bool handledByScript = ScriptRegistry<ServerScript>::ForEachEnabledHookWithReturn(SERVERHOOK_CAN_PACKET_RECEIVE, [&](ServerScript* script)
+            {
+                return !script->CanPacketReceive(this, *packet);
+            });
+
+            if (handledByScript)
+            {
+                delete packet;
+                continue;
+            }
+
             uint32 packetTime = WorldTimer::getMSTime();
+            uint32 const queueWaitMs = packet->GetPacketTime() ?
+                WorldTimer::getMSTimeDiff(packet->GetPacketTime(), packetTime) : 0;
             switch (opHandle.status)
             {
                 case STATUS_LOGGEDIN:
@@ -462,7 +541,17 @@ void WorldSession::ProcessPackets(PacketFilter& updater)
                             LogUnexpectedOpcode(packet, "the player has not logged in yet");
                     }
                     else if (_player->IsInWorld())
+                    {
                         ExecuteOpcode(opHandle, packet);
+
+                        // Let modules observe the action now that the handler ran -
+                        // a master commanding puppets mirrors quest accepts, gossip
+                        // and quest shares to them from here.
+                        ScriptRegistry<ServerScript>::ForEachEnabledHook(SERVERHOOK_ON_PACKET_HANDLED, [&](ServerScript* script)
+                        {
+                            script->OnPacketHandled(this, *packet);
+                        });
+                    }
 
                     // lag can cause STATUS_LOGGEDIN opcodes to arrive after the player started a transfer
                     break;
@@ -514,6 +603,40 @@ void WorldSession::ProcessPackets(PacketFilter& updater)
             packetTime = WorldTimer::getMSTimeDiffToNow(packetTime);
             if (sWorld.getConfig(CONFIG_UINT32_PERFLOG_SLOW_PACKET) && packetTime > sWorld.getConfig(CONFIG_UINT32_PERFLOG_SLOW_PACKET))
                 sLog.out(LOG_PERFORMANCE, "Slow packet opcode %s: %ums. Account %u on IP %s", opHandle.name, packetTime, GetAccountId(), GetRemoteAddress().c_str());
+
+            // Handler duration alone hides time spent waiting for the map tick.
+            // Report gameplay input only, at most once per second per client.
+            bool const gameplayInput = packet->GetOpcode() == CMSG_LOOT ||
+                packet->GetOpcode() == CMSG_AUTOSTORE_LOOT_ITEM ||
+                packet->GetOpcode() == CMSG_LOOT_MONEY ||
+                packet->GetOpcode() == CMSG_LOOT_RELEASE ||
+                packet->GetOpcode() == CMSG_ATTACKSWING ||
+                packet->GetOpcode() == CMSG_ATTACKSTOP ||
+                packet->GetOpcode() == CMSG_CAST_SPELL;
+            if (gameplayInput && !botPackets)
+            {
+                TurtleDiagnostics::Record(TurtleDiagnostics::InputQueue, uint64(queueWaitMs) * 1000);
+                TurtleDiagnostics::Record(TurtleDiagnostics::InputHandler, uint64(packetTime) * 1000);
+            }
+            uint32 const reportNow = WorldTimer::getMSTime();
+            static uint32 lastSlowBotHandler = 0; // synthetic dispatch is world-owned
+            if (botPackets && TurtleDiagnostics::enabled.load(std::memory_order_relaxed) &&
+                packetTime >= 25 && WorldTimer::getMSTimeDiff(lastSlowBotHandler, reportNow) >= 1000)
+            {
+                lastSlowBotHandler = reportNow;
+                sLog.out(LOG_PERFORMANCE, "TW_BOT_HANDLER_SLOW opcode=%s handler_ms=%u player=%u",
+                    opHandle.name, packetTime, _player ? _player->GetGUIDLow() : 0);
+            }
+            if (gameplayInput && !botPackets && sWorld.getConfig(CONFIG_UINT32_PERFLOG_SLOW_PACKET) &&
+                (queueWaitMs >= 250 || packetTime >= 250) &&
+                WorldTimer::getMSTimeDiff(m_lastGameplayDelayReportMs, reportNow) >= 1000)
+            {
+                m_lastGameplayDelayReportMs = reportNow;
+                sLog.out(LOG_PERFORMANCE, "GAMEPLAY_INPUT_DELAY opcode=%s queue_ms=%u handler_ms=%u map=%u player=%u diag_map=%u diag_inst=%u diag_tick=%llu",
+                    opHandle.name, queueWaitMs, packetTime, _player ? _player->GetMapId() : 0,
+                    _player ? _player->GetGUIDLow() : 0, TurtleDiagnostics::context.map,
+                    TurtleDiagnostics::context.instance, static_cast<unsigned long long>(TurtleDiagnostics::context.tick));
+            }
         }
         catch (ByteBufferException &)
         {
@@ -595,11 +718,17 @@ void WorldSession::LogoutPlayer(bool Save)
     bool doBanPlayer = false;
     bool disabledSocials = false;
 
+    // Module teardown happens from PlayerScript::OnBeforeLogout just below.
+
     if (_player)
     {
         bool inWorld = _player->IsInWorld() && _player->FindMap();
 
         sLog.out(LOG_CHAR, "[%s:%u@%s] Logout Character:[%s] (guid: %u)", GetUsername().c_str(), GetAccountId(), GetRemoteAddress().c_str(), _player->GetName() , _player->GetGUIDLow());
+        ScriptRegistry<PlayerScript>::ForEachEnabledHook(PLAYERHOOK_ON_BEFORE_LOGOUT, [&](PlayerScript* script)
+        {
+            script->OnBeforeLogout(_player);
+        });
         sDBLogger.LogCharAction({ _player->GetGUIDLow(), GetAccountId(), LogCharAction::ActionLogout, {} });
         if (ObjectGuid lootGuid = GetPlayer()->GetLootGuid())
             DoLootRelease(lootGuid);
@@ -747,8 +876,35 @@ void WorldSession::LogoutPlayer(bool Save)
 
         // remove player from the group if he is:
         // a) in group; b) not in raid group; c) logging out normally (not being kicked or disconnected)
+        //
+        // For normal logout (m_Socket set): also evict any bot members first so
+        // they don't linger in a real-player-less group after we leave.  We do
+        // this BEFORE removing the player so the bots are still in-world and
+        // their group pointers can be properly cleared.  Any bot that already
+        // logged out has a stale m_memberSlots entry; RemoveFromGroup on a null
+        // player is safe and still purges the DB row + slot.
         if (_player->GetGroup() && !_player->GetGroup()->isRaidGroup() && m_Socket)
-            _player->RemoveFromGroup();
+        {
+            Group* grp = _player->GetGroup();
+            std::vector<ObjectGuid> botGuids;
+            for (const auto& slot : grp->GetMemberSlots())
+            {
+                if (slot.guid == _player->GetObjectGuid())
+                    continue;
+                Player* member = sObjectMgr.GetPlayer(slot.guid);
+                if (!member || Script_IsMachineDriven(member))
+                    botGuids.push_back(slot.guid);
+            }
+            for (const ObjectGuid& guid : botGuids)
+            {
+                if (!_player->GetGroup())
+                    break; // group was disbanded mid-loop
+                Player::RemoveFromGroup(_player->GetGroup(), guid);
+            }
+            // Remove the player last (may trigger auto-disband if only 1 left).
+            if (_player->GetGroup())
+                _player->RemoveFromGroup();
+        }
 
         ///- Send update to group
         if (Group* group = _player->GetGroup())
@@ -767,11 +923,21 @@ void WorldSession::LogoutPlayer(bool Save)
 
         if (inWorld && !removedFromMap)
         {
+            ScriptRegistry<PlayerScript>::ForEachEnabledHook(PLAYERHOOK_ON_LOGOUT, [&](PlayerScript* script)
+            {
+                script->OnLogout(_player);
+            });
+
             Map* _map = _player->GetMap();
             _map->Remove(_player, true);
         }
         else
         {
+            ScriptRegistry<PlayerScript>::ForEachEnabledHook(PLAYERHOOK_ON_LOGOUT, [&](PlayerScript* script)
+            {
+                script->OnLogout(_player);
+            });
+
             _player->CleanupsBeforeDelete();
             Map::DeleteFromWorld(_player);
         }
@@ -823,6 +989,15 @@ void WorldSession::KickPlayer()
 }
 
 /// Cancel channeling handler
+
+// bot calls session->SendPlaySpellVisual(guid, kit).
+void WorldSession::SendPlaySpellVisual(ObjectGuid guid, uint32 spellArtKit)
+{
+    WorldPacket data(SMSG_PLAY_SPELL_VISUAL, 8 + 4);
+    data << guid;
+    data << uint32(spellArtKit);
+    SendPacket(&data);
+}
 
 void WorldSession::SendAreaTriggerMessage(const char* Text, ...)
 {
